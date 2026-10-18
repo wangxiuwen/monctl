@@ -63,6 +63,20 @@ Safety rails:
 | Linux (KDE Wayland) | `kscreen-doctor output.<name>.disable/enable` | |
 | Linux (GNOME Wayland) | not supported yet | no stable public interface; use an X11 session |
 
+Windows specifics (verified on real hardware):
+
+- **Run it inside your desktop session.** Windows display APIs are
+  session-scoped: from a service / SSH context (session 0)
+  `EnumDisplayDevicesW` sees nothing, so remote-execution wrappers must land
+  the process in the interactive session (e.g. a scheduled task with an
+  interactive token).
+- **Some outputs refuse detaching.** GPU phantom outputs (an adapter with no
+  real panel) reject the zero-sized mode with `DISP_CHANGE_BADMODE`; monctl
+  reports it and leaves everything untouched. Real panels detach fine — this
+  is the same limitation MultiMonitorTool has.
+- Re-attach always falls back to a real registry mode, never 0x0, so a
+  restored screen can't come back dead.
+
 Windows ids (`\\.\DISPLAY2`) and Linux ids (`DP-1`) are shown by `monctl list`;
 macOS ids are numeric and change across reboots (the remembered off-state is
 cleared on reboot anyway).

@@ -14,6 +14,7 @@ type BOOL = i32;
 type WCHAR = u16;
 
 const ENUM_CURRENT_SETTINGS: DWORD = 0xFFFF_FFFF;
+const EDD_GET_DEVICE_INTERFACE_NAME: DWORD = 0x0000_0001;
 const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP: DWORD = 0x0000_0001;
 const DISPLAY_DEVICE_ACTIVE: DWORD = 0x0000_0010;
 const DISPLAY_DEVICE_PRIMARY_DEVICE: DWORD = 0x0000_0004;
@@ -168,6 +169,37 @@ fn current_settings(device: &str) -> Option<DEVMODEW> {
     }
 }
 
+/// First registry mode with real dimensions — fallback for devices whose
+/// "current settings" are zeroed (phantom outputs), so a re-attach can never
+/// apply a 0x0 mode and kill a screen for good.
+fn any_real_mode(device: &str) -> Option<DEVMODEW> {
+    let wide = string_to_wide(device);
+    for i in 0..200u32 {
+        let mut dm = DEVMODEW::new();
+        if unsafe { EnumDisplaySettingsW(wide.as_ptr(), i, &mut dm) } == 0 {
+            break;
+        }
+        if dm.dm_pels_width > 0 && dm.dm_pels_height > 0 {
+            return Some(dm);
+        }
+    }
+    None
+}
+
+/// EDID monitor name attached to an adapter ("DELL P2314H"), falling back to
+/// the adapter string ("NVIDIA GeForce RTX 4070") when no monitor is attached.
+fn monitor_name(adapter: &str) -> Option<String> {
+    let wide = string_to_wide(adapter);
+    let mut dd = DISPLAY_DEVICEW::new();
+    if unsafe { EnumDisplayDevicesW(wide.as_ptr(), 0, &mut dd, EDD_GET_DEVICE_INTERFACE_NAME) } != 0 {
+        let s = wide_to_string(&dd.device_string);
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
 pub fn list() -> Vec<DisplayInfo> {
     adapters()
         .into_iter()
@@ -177,17 +209,21 @@ pub fn list() -> Vec<DisplayInfo> {
             let detail = current_settings(&device)
                 .filter(|_| active)
                 .map(|dm| {
+                    if dm.dm_pels_width == 0 || dm.dm_pels_height == 0 {
+                        return "n/a".to_string();
+                    }
                     let hz = unsafe { dm.u.display_frequency };
                     let r = if hz > 1 { format!(" @{}Hz", hz) } else { String::new() };
                     format!("{}x{}{} ({},{})",
                         dm.dm_pels_width, dm.dm_pels_height, r, dm.dm_position.x, dm.dm_position.y)
                 })
                 .unwrap_or_else(|| "n/a".into());
+            let name = monitor_name(&device).unwrap_or(description);
             DisplayInfo {
                 id: device,
                 active,
                 main,
-                name: if description.is_empty() { "Display".into() } else { description },
+                name: if name.is_empty() { "Display".into() } else { name },
                 detail,
             }
         })
@@ -217,12 +253,16 @@ pub fn set_enabled(id: &str, enable: bool) -> Result<(), String> {
         return Err(format!("'{id}' is not a valid Windows display id (expected \\\\.\\DISPLAYn, see `monctl list`)"));
     }
     if enable {
-        // attach: restore the stored mode, positioned to the right of the current desktop
-        let mut dm = current_settings(id).ok_or_else(|| format!("no stored mode for {id} — cannot re-attach it"))?;
+        // attach: restore the stored mode (or any real mode), placed to the right of the desktop
+        let mut dm = match current_settings(id).filter(|dm| dm.dm_pels_width > 0 && dm.dm_pels_height > 0) {
+            Some(dm) => dm,
+            None => any_real_mode(id).ok_or_else(|| format!("no usable stored mode for {id} — cannot re-attach it"))?,
+        };
         let right_edge = list()
             .iter()
             .filter(|d| d.active)
             .filter_map(|d| current_settings(&d.id))
+            .filter(|dm| dm.dm_pels_width > 0)
             .map(|dm| dm.dm_position.x + dm.dm_pels_width as i32)
             .max()
             .unwrap_or(0);
