@@ -1,0 +1,19 @@
+[package]
+name = "monctl"
+version = "0.1.0"
+edition = "2021"
+description = "Turn individual displays on/off from the command line — as if the cable were pulled (macOS / Windows / Linux)"
+license = "MIT"
+repository = "https://github.com/wangxiuwen/monctl"
+keywords = ["display", "monitor", "cli", "multi-monitor"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "monctl"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+strip = true
+lto = true
