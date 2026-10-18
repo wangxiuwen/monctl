@@ -154,6 +154,49 @@ private func writeAgentPlist() throws {
     try plist.write(to: agentPlistURL(), atomically: true, encoding: .utf8)
 }
 
+// MARK: - keep awake (delegates to the monctl CLI's `awake` holder)
+
+private func monctlPath() -> String? {
+    let dir = (binaryPath() as NSString).deletingLastPathComponent
+    let sibling = dir + "/monctl"
+    if FileManager.default.isExecutableFile(atPath: sibling) { return sibling }
+    return nil
+}
+
+private func runMonctlAwake(_ args: [String]) {
+    guard let monctl = monctlPath() else { return }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: monctl)
+    p.arguments = ["awake"] + args
+    p.standardOutput = Pipe()
+    p.standardError = Pipe()
+    try? p.run()
+}
+
+/// nil when nothing is holding; otherwise remaining seconds.
+private func awakeRemaining() -> Double? {
+    let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("monctl/awake.json")
+    guard let s = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+    func num(_ key: String) -> Double? {
+        guard let r = s.range(of: "\"\(key)\":") else { return nil }
+        let digits = s[r.upperBound...].prefix { $0.isNumber }
+        return Double(digits)
+    }
+    guard let deadline = num("deadline"), let heartbeat = num("heartbeat") else { return nil }
+    if num("release") == 1 { return nil }
+    let now = Date().timeIntervalSince1970
+    if now - heartbeat > 15 { return nil } // stale holder (crash/reboot)
+    return max(0, deadline - now)
+}
+
+private func fmtRemaining(_ secs: Double) -> String {
+    let s = Int(secs)
+    if s >= 3600 { return "\(s / 3600)h\(String(format: "%02d", (s % 3600) / 60))m" }
+    if s >= 60 { return "\(s / 60)m\(String(format: "%02d", s % 60))s" }
+    return "\(s)s"
+}
+
 // MARK: - menu bar UI
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -201,6 +244,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addItem("只留主屏", action: #selector(soloMain), target: self, enabled: activeCount > 1)
         addItem("全部开启", action: #selector(allOn), target: self, enabled: activeCount < displays.count || !remembered.isEmpty)
         menu.addItem(.separator())
+        if let monctl = monctlPath() {
+            let remaining = awakeRemaining()
+            let awakeTitle = remaining != nil
+                ? "保持唤醒（剩余 \(fmtRemaining(remaining!))）"
+                : "保持唤醒"
+            let awakeItem = NSMenuItem(title: awakeTitle, action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            for (label, secs) in [("1 小时", "3600"), ("4 小时", "14400"), ("8 小时", "28800"), ("不限时", "")] {
+                let it = NSMenuItem(title: label, action: #selector(awakeFor(_:)), keyEquivalent: "")
+                it.target = self
+                it.isEnabled = remaining == nil || secs == ""
+                it.representedObject = secs as NSString
+                sub.addItem(it)
+            }
+            sub.addItem(.separator())
+            let off = NSMenuItem(title: "解除保持", action: #selector(awakeFor(_:)), keyEquivalent: "")
+            off.target = self
+            off.isEnabled = remaining != nil
+            off.representedObject = "off" as NSString
+            sub.addItem(off)
+            awakeItem.submenu = sub
+            menu.addItem(awakeItem)
+            _ = monctl
+        }
         let autoStart = NSMenuItem(title: "开机启动", action: #selector(toggleAutoStart(_:)), keyEquivalent: "")
         autoStart.target = self
         autoStart.state = agentInstalled() ? .on : .off
@@ -276,6 +343,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             launchctl(["bootout", "\(domain)/\(agentLabel)"])
         }
+    }
+
+    @objc private func awakeFor(_ sender: NSMenuItem) {
+        guard let arg = (sender.representedObject as? String) else { return }
+        runMonctlAwake(arg == "" ? [] : [arg])
+        statusItem.menu?.cancelTracking()
+        rebuildMenu()
     }
 
     @objc private func toggleAutoStart(_ sender: NSMenuItem) {

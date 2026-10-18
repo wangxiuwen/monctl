@@ -36,9 +36,13 @@ monctl toggle [ID|main]      切换某块屏
 monctl solo [ID|main]        只保留一块屏    （默认：主屏）
 monctl all                   全部开启
 monctl forget [ID|all]       清除记住的关闭状态
+
+monctl awake [时长]          阻止休眠（2h、90m、2h30m、3600；不带时长 = 直到解除）
+monctl awake off|status      解除 / 查看保持状态（--display 连屏幕一起常亮）
+monctl sleep                 立即休眠
 ```
 
-安全设计：
+显示器安全设计：
 
 - **最后一块活动屏永远关不掉**。只剩一块屏时 `off` 直接拒绝（退出码 1），
   不可能把自己弄瞎。
@@ -47,6 +51,33 @@ monctl forget [ID|all]       清除记住的关闭状态
   `~/.config/monctl/state.json`，Windows `%APPDATA%\monctl\state.json`）。
   因为屏幕被关后会从系统枚举里彻底消失，只有记住 id 才能找回来。
 - macOS 上是会话级状态：注销/重启自动清空，不会重启后莫名黑一块屏。
+
+## 防休眠
+
+`awake` 的设计对标经典的 `caffeinate`，但是即发即忘、跨平台。`monctl awake 2h`
+立刻返回：一个极小的后台 holder 进程持有系统级电源断言，到点自动退出——之后
+休眠自然恢复。不驻留常驻服务、不改系统电源设置；holder 进程意外死掉时保持
+也会自动失效，不会出现「永远醒着」。
+
+```console
+$ monctl awake 2h            # 保持 2 小时，之后允许休眠
+awake: holding for 2h00m, sleep allowed again after that
+$ monctl awake 8h --display  # 连屏幕一起常亮
+$ monctl awake               # 一直保持，直到解除
+$ monctl awake status
+awake: holding, 1h59m left [holder pid 87571]
+$ monctl awake off
+awake: released
+```
+
+重复执行 `awake` 会顺延/替换到期时间。各平台机制：IOKit 电源断言（macOS，
+`pmset -g assertions` 可见）、`SetThreadExecutionState`（Windows）、
+`systemd-inhibit`（Linux）。
+
+macOS 上的保持同时包含 `PreventSystemSleep`（即 `caffeinate -s` 的效果）：
+合盖状态下只要接着电源就不会睡——专为合盖外接的使用方式设计。和所有主流
+工具（包括 Amphetamine）一样，苹果菜单里手动点「睡眠」仍然会睡；被挡住的是
+闲置休眠和合盖休眠。
 
 ## 平台支持
 

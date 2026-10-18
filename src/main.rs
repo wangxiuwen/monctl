@@ -24,6 +24,7 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
+mod awake;
 mod common;
 
 use common::{DisplayInfo, OffState};
@@ -182,6 +183,10 @@ usage:\n\
   monctl all                   enable every connected display\n\
   monctl forget [ID|all]       drop remembered off-state entries\n\
 \n\
+  monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)\n\
+  monctl awake off|status      release / inspect the hold (--display also keeps the screen on)\n\
+  monctl sleep                 suspend the machine now\n\
+\n\
 state made with off/solo lasts until logout/reboot - `monctl all` brings everything back.\n"
     );
     std::process::exit(0);
@@ -192,10 +197,18 @@ fn main() {
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("list");
     let token = args.get(1).map(|s| s.as_str());
 
+    // awake/sleep don't touch displays - and on Windows a service context
+    // (session 0) can't enumerate them at all, so dispatch first.
+    match cmd {
+        "-h" | "--help" | "help" => usage(),
+        "awake" => awake::run(&args[1..]),
+        "sleep" => awake::sleep_now(),
+        _ => {}
+    }
+
     let displays = platform::list();
 
     match cmd {
-        "-h" | "--help" | "help" => usage(),
         "list" | "ls" => {
             if displays.is_empty() {
                 fail("no display found");
@@ -236,7 +249,7 @@ fn main() {
                 Some(t) => displays.iter().find(|d| d.id == t).cloned().unwrap_or_else(|| fail(&format!("unknown target '{t}'"))),
             };
             if !keep.active {
-                run_enable(true, &[keep.clone()]);
+                run_enable(true, std::slice::from_ref(&keep));
             }
             let others: Vec<DisplayInfo> = displays.iter().filter(|d| d.active && d.id != keep.id).cloned().collect();
             if others.is_empty() {

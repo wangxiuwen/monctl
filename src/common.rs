@@ -27,6 +27,14 @@ impl DisplayInfo {
 pub type OffState = BTreeMap<String, String>;
 
 pub fn state_path() -> PathBuf {
+    config_dir().join("monctl/state.json")
+}
+
+pub fn awake_path() -> PathBuf {
+    config_dir().join("monctl/awake.json")
+}
+
+fn config_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -41,7 +49,7 @@ pub fn state_path() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join("AppData/Roaming"));
-    base.join("monctl/state.json")
+    base
 }
 
 pub fn load_state() -> OffState {

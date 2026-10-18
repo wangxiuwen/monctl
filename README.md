@@ -39,9 +39,13 @@ monctl toggle [ID|main]      flip one display
 monctl solo [ID|main]        keep only one display on (default: main)
 monctl all                   enable every connected display
 monctl forget [ID|all]       drop remembered off-state entries
+
+monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)
+monctl awake off|status      release / inspect the hold (--display also keeps the screen on)
+monctl sleep                 suspend the machine now
 ```
 
-Safety rails:
+Display safety rails:
 
 - **The last active screen can never be turned off.** `off` refuses (exit 1)
   when only one display is active — you can't blind yourself.
@@ -52,6 +56,36 @@ Safety rails:
   enumeration entirely — remembering its id is the only way back.
 - On macOS the change is session-scoped: logout/reboot clears it, so a reboot
   never leaves you with a mysteriously dead screen.
+
+## Keeping the machine awake
+
+`awake` works like the classic `caffeinate`, but fire-and-forget and
+cross-platform. `monctl awake 2h` returns immediately; a tiny detached holder
+process keeps an OS-level power assertion alive for the duration, then exits
+by itself — sleep simply becomes possible again. No lingering daemon, no
+settings mutated, survives-holder-death cleanly (the hold auto-expires if the
+holder process disappears).
+
+```console
+$ monctl awake 2h            # 2 hours, then allow sleep again
+awake: holding for 2h00m, sleep allowed again after that
+$ monctl awake 8h --display  # also keep the screen on
+$ monctl awake               # until released
+$ monctl awake status
+awake: holding, 1h59m left [holder pid 87571]
+$ monctl awake off
+awake: released
+```
+
+Re-running `awake` extends/replaces the deadline. Mechanisms per platform:
+IOKit power assertions (macOS, visible in `pmset -g assertions`),
+`SetThreadExecutionState` (Windows), `systemd-inhibit` (Linux).
+
+On macOS the hold includes `PreventSystemSleep` (the `caffeinate -s`
+behaviour): with the lid closed the machine stays awake as long as it's on AC
+power — made for lid-closed, external-monitor setups. Like every mainstream
+tool (Amphetamine included), an explicit "Sleep" from the Apple menu still
+wins; idle and lid-close sleep are what get blocked.
 
 ## Platform notes
 
