@@ -1,4 +1,4 @@
-// monctl — turn individual displays on/off, as if the cable were pulled.
+// monctl - turn individual displays on/off, as if the cable were pulled.
 // macOS / Windows / Linux, dependency-free.
 //
 // usage:
@@ -79,7 +79,7 @@ fn resolve_on_targets(token: Option<&str>, displays: &[DisplayInfo]) -> Vec<Disp
             ids.extend(state.keys().cloned()); // ids that vanished from the OS entirely
             ids.retain(|id| !displays.iter().any(|d| d.id == *id && d.active));
             if ids.is_empty() {
-                fail("nothing to enable — every connected display is already on");
+                fail("nothing to enable - every connected display is already on");
             }
             ids.iter()
                 .map(|id| {
@@ -163,7 +163,7 @@ fn run_enable(enabled: bool, targets: &[DisplayInfo]) {
     }
     common::save_state(&state);
     let now_active = active(&platform::list()).len();
-    println!("— {now_active} display{} active now ({} changed)", if now_active == 1 { "" } else { "s" }, targets.len() - errors);
+    println!("- {now_active} display{} active now ({} changed)", if now_active == 1 { "" } else { "s" }, targets.len() - errors);
     if errors > 0 {
         std::process::exit(1);
     }
@@ -171,7 +171,7 @@ fn run_enable(enabled: bool, targets: &[DisplayInfo]) {
 
 fn usage() -> ! {
     print!(
-        "monctl — turn individual displays on/off (as if unplugged)\n\
+        "monctl - turn individual displays on/off (as if unplugged)\n\
 \n\
 usage:\n\
   monctl list                  show all connected displays\n\
@@ -182,7 +182,7 @@ usage:\n\
   monctl all                   enable every connected display\n\
   monctl forget [ID|all]       drop remembered off-state entries\n\
 \n\
-state made with off/solo lasts until logout/reboot — `monctl all` brings everything back.\n"
+state made with off/solo lasts until logout/reboot - `monctl all` brings everything back.\n"
     );
     std::process::exit(0);
 }
@@ -225,7 +225,7 @@ fn main() {
                     if common::load_state().contains_key(t) {
                         run_enable(true, &[ghost(t, &common::load_state())]);
                     } else {
-                        fail(&format!("unknown target '{t}' — use a display id or `main`"));
+                        fail(&format!("unknown target '{t}' - use a display id or `main`"));
                     }
                 }
             },
@@ -240,7 +240,7 @@ fn main() {
             }
             let others: Vec<DisplayInfo> = displays.iter().filter(|d| d.active && d.id != keep.id).cloned().collect();
             if others.is_empty() {
-                println!("— {} is the only active display already", keep.name);
+                println!("- {} is the only active display already", keep.name);
             } else {
                 run_enable(false, &others);
             }

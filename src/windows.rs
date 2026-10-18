@@ -14,8 +14,10 @@ type BOOL = i32;
 type WCHAR = u16;
 
 const ENUM_CURRENT_SETTINGS: DWORD = 0xFFFF_FFFF;
+const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP: DWORD = 0x0000_0001;
 const DISPLAY_DEVICE_ACTIVE: DWORD = 0x0000_0010;
 const DISPLAY_DEVICE_PRIMARY_DEVICE: DWORD = 0x0000_0004;
+const DISPLAY_DEVICE_MIRRORING_DRIVER: DWORD = 0x0000_0008;
 const DM_POSITION: DWORD = 0x0000_0020;
 const DM_PELSWIDTH: DWORD = 0x0008_0000;
 const DM_PELSHEIGHT: DWORD = 0x0010_0000;
@@ -148,7 +150,7 @@ fn adapters() -> Vec<(String, String, DWORD)> {
             break;
         }
         let flags = dd.state_flags;
-        if flags & 0x0000_0020 != 0 {
+        if flags & DISPLAY_DEVICE_MIRRORING_DRIVER != 0 {
             continue; // mirror driver / pseudo device
         }
         out.push((wide_to_string(&dd.device_name), wide_to_string(&dd.device_string), flags));
@@ -170,7 +172,7 @@ pub fn list() -> Vec<DisplayInfo> {
     adapters()
         .into_iter()
         .map(|(device, description, flags)| {
-            let active = flags & DISPLAY_DEVICE_ACTIVE != 0;
+            let active = flags & (DISPLAY_DEVICE_ACTIVE | DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
             let main = flags & DISPLAY_DEVICE_PRIMARY_DEVICE != 0;
             let detail = current_settings(&device)
                 .filter(|_| active)
