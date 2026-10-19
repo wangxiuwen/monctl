@@ -1,39 +1,18 @@
 // monctl - turn individual displays on/off, as if the cable were pulled.
-// macOS / Windows / Linux, dependency-free.
-//
-// usage:
-//   monctl list                  show all connected displays
-//   monctl off  [ID|main]        disable a display        (default: the non-main one)
-//   monctl on   [ID|main|all]    enable display(s)        (default: all that are off)
-//   monctl toggle [ID|main]      flip one display
-//   monctl solo [ID|main]        keep only one display on (default: main)
-//   monctl all                   enable every display
-//   monctl forget [ID|all]       drop remembered off-state entries
+// macOS / Windows / Linux, dependency-free. Front end for the monctl lib.
 
 #[cfg(target_os = "macos")]
-use macos as platform;
+use monctl::macos as platform;
 #[cfg(target_os = "windows")]
-use windows as platform;
+use monctl::windows as platform;
 #[cfg(target_os = "linux")]
-use linux as platform;
+use monctl::linux as platform;
 
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "linux")]
-mod linux;
-#[cfg(target_os = "windows")]
-mod windows;
+use monctl::common;
+use monctl::common::{fail, usage, DisplayInfo, OffState};
+use monctl::awake;
 
-mod awake;
-mod common;
-
-use common::{DisplayInfo, OffState};
 use std::collections::BTreeSet;
-
-fn fail(msg: &str) -> ! {
-    eprintln!("monctl: {msg}");
-    std::process::exit(1);
-}
 
 fn active(displays: &[DisplayInfo]) -> Vec<&DisplayInfo> {
     displays.iter().filter(|d| d.active).collect()
@@ -168,28 +147,6 @@ fn run_enable(enabled: bool, targets: &[DisplayInfo]) {
     if errors > 0 {
         std::process::exit(1);
     }
-}
-
-fn usage() -> ! {
-    print!(
-        "monctl - turn individual displays on/off (as if unplugged)\n\
-\n\
-usage:\n\
-  monctl list                  show all connected displays\n\
-  monctl off  [ID|main]        disable a display        (default: the non-main one)\n\
-  monctl on   [ID|main|all]    enable display(s)        (default: all that are off)\n\
-  monctl toggle [ID|main]      flip one display\n\
-  monctl solo [ID|main]        keep only one display on (default: main)\n\
-  monctl all                   enable every connected display\n\
-  monctl forget [ID|all]       drop remembered off-state entries\n\
-\n\
-  monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)\n\
-  monctl awake off|status      release / inspect the hold (--display also keeps the screen on)\n\
-  monctl sleep                 suspend the machine now\n\
-\n\
-state made with off/solo lasts until logout/reboot - `monctl all` brings everything back.\n"
-    );
-    std::process::exit(0);
 }
 
 fn main() {

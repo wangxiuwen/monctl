@@ -49,13 +49,19 @@ Display safety rails:
 
 - **The last active screen can never be turned off.** `off` refuses (exit 1)
   when only one display is active — you can't blind yourself.
+- **Global recovery hotkey** (both tray apps): `Ctrl+Alt+Shift+D`
+  (`⌃⌥⇧D` on macOS) re-enables every display, blind-safe — even if the
+  remaining screen is dark, one keypress brings the others back.
 - Off-state is remembered in a small JSON file
   (`~/Library/Application Support/monctl/state.json` on macOS,
   `~/.config/monctl/state.json` on Linux, `%APPDATA%\monctl\state.json`
   on Windows), because a disabled display usually vanishes from the OS
   enumeration entirely — remembering its id is the only way back.
 - On macOS the change is session-scoped: logout/reboot clears it, so a reboot
-  never leaves you with a mysteriously dead screen.
+  never leaves you with a mysteriously dead screen. Physical fallbacks always
+  work too: replug the cable, power-cycle the monitor, or reboot.
+  (Moving the mouse only wakes *sleeping* displays — a monctl-disabled display
+  is "unplugged" by definition, which is why the hotkey exists.)
 
 ## Keeping the machine awake
 
@@ -118,10 +124,19 @@ cleared on reboot anyway).
 ## Extras
 
 - **macOS menu bar app**: [`macos-tray/`](macos-tray) — a tiny tray app with the
-  same toggle per display, "keep only main", and the same last-screen guard.
-  Build with `swiftc -O macos-tray/tray.swift -o ~/bin/monctl-tray` (see
-  [macos-tray/README.md](macos-tray/README.md)). It shares the same state file
+  same toggle per display, "keep only main", "keep awake" durations, an
+  auto-start-at-login toggle, and the same last-screen guard. Build with
+  `swiftc -O macos-tray/tray.swift -o ~/bin/monctl-tray` (see
+  [macos-tray/README.md](macos-tray/README.md)). It shares the same state files
   as the CLI.
+- **Windows tray**: built from the same repo — `cargo build --release` produces
+  `monctl-tray.exe` next to `monctl.exe` (pure win32, no dependencies). Same
+  menus, plus an autostart toggle backed by the `HKCU …\Run` registry key.
+  Like all Windows display APIs it must run in the logged-on user's session.
+- **Running monctl on a headless Windows box over remote exec** (winforge,
+  SSH-as-SYSTEM, …): the service context cannot see displays, so hop into the
+  console session with a one-shot scheduled task — template in
+  [`extras/windows-session-run.cmd`](extras/windows-session-run.cmd).
 
 ## Build
 

@@ -4,6 +4,35 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+/// Print an error to stderr and exit(1). Used by every front end.
+pub fn fail(msg: &str) -> ! {
+    eprintln!("monctl: {msg}");
+    std::process::exit(1);
+}
+
+/// CLI usage text; also the help back end for `awake` with bad arguments.
+pub fn usage() -> ! {
+    print!(
+        "monctl - turn individual displays on/off (as if unplugged)\n\
+\n\
+usage:\n\
+  monctl list                  show all connected displays\n\
+  monctl off  [ID|main]        disable a display        (default: the non-main one)\n\
+  monctl on   [ID|main|all]    enable display(s)        (default: all that are off)\n\
+  monctl toggle [ID|main]      flip one display\n\
+  monctl solo [ID|main]        keep only one display on (default: main)\n\
+  monctl all                   enable every connected display\n\
+  monctl forget [ID|all]       drop remembered off-state entries\n\
+\n\
+  monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)\n\
+  monctl awake off|status      release / inspect the hold (--display also keeps the screen on)\n\
+  monctl sleep                 suspend the machine now\n\
+\n\
+state made with off/solo lasts until logout/reboot - `monctl all` brings everything back.\n"
+    );
+    std::process::exit(0);
+}
+
 /// One connected display. `id` is the platform key used to toggle it
 /// (CGDirectDisplayID on macOS, `\\.\DISPLAYn` on Windows, connector name on Linux).
 #[derive(Clone, Debug)]

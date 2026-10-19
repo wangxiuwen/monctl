@@ -7,6 +7,7 @@
 // Build:  swiftc -O tray.swift -o ~/.local/bin/monctl-tray
 
 import AppKit
+import Carbon
 import CoreGraphics
 import Darwin
 
@@ -197,6 +198,40 @@ private func fmtRemaining(_ secs: Double) -> String {
     return "\(s)s"
 }
 
+// MARK: - global recovery hotkey (Ctrl+Option+Shift+D = turn every display on)
+
+private func enableAllDisplaysCore() {
+    let displays = onlineDisplays()
+    var ids = Set(displays.filter { !$0.active }.map { $0.id })
+    ids.formUnion(loadState().keys)
+    ids.subtract(displays.filter { $0.active }.map { $0.id })
+    for id in ids.sorted() {
+        if setDisplayEnabled(id, true) == nil {
+            var st = loadState()
+            st.removeValue(forKey: id)
+            saveState(st)
+        }
+    }
+}
+
+private func installRecoveryHotkey() {
+    var hotKeyRef: EventHotKeyRef?
+    var hotKeyID = EventHotKeyID(signature: OSType(0x6D6F_6E63) /* "monc" */, id: 1)
+    var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+    let callback: EventHandlerUPP = { _, event, _ -> OSStatus in
+        var id = EventHotKeyID()
+        guard let event else { return noErr }
+        GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
+        if id.id == 1 {
+            enableAllDisplaysCore()
+        }
+        return noErr
+    }
+    InstallEventHandler(GetApplicationEventTarget(), callback, 1, &eventType, nil, nil)
+    // kVK_ANSI_D = 2; controlKey | optionKey | shiftKey
+    RegisterEventHotKey(2, UInt32(controlKey | optionKey | shiftKey), hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+}
+
 // MARK: - menu bar UI
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -212,6 +247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         rebuildMenu()
+        installRecoveryHotkey()
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) { rebuildMenu() }
@@ -242,7 +278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
         addItem("只留主屏", action: #selector(soloMain), target: self, enabled: activeCount > 1)
-        addItem("全部开启", action: #selector(allOn), target: self, enabled: activeCount < displays.count || !remembered.isEmpty)
+        addItem("全部开启 ⌃⌥⇧D", action: #selector(allOn), target: self, enabled: activeCount < displays.count || !remembered.isEmpty)
         menu.addItem(.separator())
         if let monctl = monctlPath() {
             let remaining = awakeRemaining()
@@ -308,16 +344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func allOn() {
-        let displays = onlineDisplays()
-        var ids = Set(displays.filter { !$0.active }.map(\.id))
-        ids.formUnion(loadState().keys)
-        ids.subtract(displays.filter(\.active).map(\.id))
-        for id in ids.sorted() {
-            if let err = setDisplayEnabled(id, true) { return alert("开启失败：\(err)") }
-            var state = loadState()
-            state.removeValue(forKey: id)
-            saveState(state)
-        }
+        enableAllDisplaysCore()
         statusItem.menu?.cancelTracking()
         rebuildMenu()
     }

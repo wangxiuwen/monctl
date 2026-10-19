@@ -331,7 +331,7 @@ fn hold(secs: u64, display: bool) {
     }
     let holder_pid = match spawn_holder(display) {
         Ok(pid) => pid,
-        Err(e) => crate::fail(&e),
+        Err(e) => crate::common::fail(&e),
     };
     // give the holder a moment to take over and start heartbeating
     thread::sleep(Duration::from_millis(700));
@@ -372,7 +372,7 @@ pub fn run(args: &[String]) -> ! {
         Some("off" | "release") => release(),
         Some(s) => match parse_duration(s) {
             Some(secs) if secs > 0 => hold(secs, display),
-            _ => crate::fail(&format!("bad duration '{s}' - use e.g. 2h, 90m, 2h30m, 3600")),
+            _ => crate::common::fail(&format!("bad duration '{s}' - use e.g. 2h, 90m, 2h30m, 3600")),
         },
     }
     std::process::exit(0);
@@ -397,7 +397,7 @@ pub fn sleep_now() -> ! {
             println!("sleep: suspending now");
             std::process::exit(0)
         }
-        Ok(s) => crate::fail(&format!("suspend request failed (exit {})", s.code().unwrap_or(-1))),
-        Err(e) => crate::fail(&format!("cannot run suspend command: {e}")),
+        Ok(s) => crate::common::fail(&format!("suspend request failed (exit {})", s.code().unwrap_or(-1))),
+        Err(e) => crate::common::fail(&format!("cannot run suspend command: {e}")),
     }
 }
