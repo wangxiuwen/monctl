@@ -28,6 +28,15 @@ fn ghost(id: &str, state: &OffState) -> DisplayInfo {
     }
 }
 
+/// Find a display by exact id (`\\.\DISPLAY2`) or the short form users type
+/// from `monctl list` output (`DISPLAY2`, or even `2` for macOS-style ids).
+fn find_display<'a>(displays: &'a [DisplayInfo], token: &str) -> Option<&'a DisplayInfo> {
+    if let Some(d) = displays.iter().find(|d| d.id == token) {
+        return Some(d);
+    }
+    displays.iter().find(|d| d.id.ends_with(token) && d.id.len() > token.len() && !token.starts_with('\\'))
+}
+
 fn resolve_off_target(token: Option<&str>, displays: &[DisplayInfo]) -> DisplayInfo {
     let act = active(displays);
     if act.is_empty() {
@@ -40,7 +49,7 @@ fn resolve_off_target(token: Option<&str>, displays: &[DisplayInfo]) -> DisplayI
         Some("main") => act.iter().find(|d| d.main).unwrap_or_else(|| {
             fail("no active main display found");
         }),
-        Some(t) => match displays.iter().find(|d| d.id == t) {
+        Some(t) => match find_display(displays, t) {
             Some(d) => d,
             None => fail(&format!("display '{t}' is not connected (run `monctl list`)")),
         },
@@ -58,6 +67,13 @@ fn resolve_on_targets(token: Option<&str>, displays: &[DisplayInfo]) -> Vec<Disp
             let mut ids: BTreeSet<String> = displays.iter().filter(|d| !d.active).map(|d| d.id.clone()).collect();
             ids.extend(state.keys().cloned()); // ids that vanished from the OS entirely
             ids.retain(|id| !displays.iter().any(|d| d.id == *id && d.active));
+            // phantom outputs (virtual adapters with no panel) can never be
+            // re-attached; don't report them as errors every time
+            #[cfg(windows)]
+            ids.retain(|id| match displays.iter().find(|d| d.id == *id) {
+                Some(_) => monctl::windows::can_attach(id),
+                None => true, // remembered-off ghost: a real display we turned off
+            });
             if ids.is_empty() {
                 fail("nothing to enable - every connected display is already on");
             }
@@ -76,7 +92,7 @@ fn resolve_on_targets(token: Option<&str>, displays: &[DisplayInfo]) -> Vec<Disp
             None => fail("the main display is already on (or not connected)"),
         },
         Some(t) => {
-            if let Some(d) = displays.iter().find(|d| d.id == t) {
+            if let Some(d) = find_display(displays, t) {
                 if d.active {
                     fail(&format!("display '{t}' is already on"));
                 }
@@ -121,10 +137,22 @@ fn print_list(displays: &[DisplayInfo]) {
     }
 }
 
-fn run_enable(enabled: bool, targets: &[DisplayInfo]) {
+fn run_enable(enabled: bool, targets: &[DisplayInfo], explicit: bool) {
     let mut state = common::load_state();
     let mut errors = 0;
     for t in targets {
+        // Windows drivers may accept detaching the primary display but refuse
+        // the re-attach afterwards (DISP_CHANGE_FAILED), leaving it dark until
+        // reboot — verified on NVIDIA. Never close the primary there.
+        #[cfg(windows)]
+        if !enabled && t.main {
+            eprintln!(
+                "monctl: refusing to turn off the primary display {} - Windows drivers may not bring it back until reboot (turn off a secondary display instead)",
+                t.describe()
+            );
+            errors += 1;
+            continue;
+        }
         match platform::set_enabled(&t.id, enabled) {
             Ok(()) => {
                 if enabled {
@@ -136,8 +164,16 @@ fn run_enable(enabled: bool, targets: &[DisplayInfo]) {
                 println!("{verb}  {}", t.describe());
             }
             Err(e) => {
-                eprintln!("monctl: failed to {} {}: {}", if enabled { "enable" } else { "disable" }, t.describe(), e);
-                errors += 1;
+                if explicit {
+                    eprintln!("monctl: failed to {} {}: {}", if enabled { "enable" } else { "disable" }, t.describe(), e);
+                    errors += 1;
+                } else {
+                    // bulk commands sweep up phantom outputs (GPU heads /
+                    // virtual adapters with no panel) that can never attach;
+                    // they are noise, not errors. A named target still fails
+                    // loudly above.
+                    println!("- skipped {} (cannot be attached: {e})", t.describe());
+                }
             }
         }
     }
@@ -174,26 +210,26 @@ fn main() {
         }
         "off" => {
             let t = resolve_off_target(token, &displays);
-            run_enable(false, &[t]);
+            run_enable(false, &[t], true);
         }
         "on" => {
             let targets = resolve_on_targets(token, &displays);
-            run_enable(true, &targets);
+            run_enable(true, &targets, token.is_some());
         }
         "all" => {
             let targets = resolve_on_targets(None, &displays);
-            run_enable(true, &targets);
+            run_enable(true, &targets, false);
         }
         "toggle" => match token {
             None => {
                 let t = resolve_off_target(None, &displays);
-                run_enable(false, &[t]);
+                run_enable(false, &[t], true);
             }
-            Some(t) => match displays.iter().find(|d| d.id == t) {
-                Some(d) => run_enable(!d.active, std::slice::from_ref(d)),
+            Some(t) => match find_display(&displays, t) {
+                Some(d) => run_enable(!d.active, std::slice::from_ref(d), true),
                 None => {
                     if common::load_state().contains_key(t) {
-                        run_enable(true, &[ghost(t, &common::load_state())]);
+                        run_enable(true, &[ghost(t, &common::load_state())], true);
                     } else {
                         fail(&format!("unknown target '{t}' - use a display id or `main`"));
                     }
@@ -203,16 +239,16 @@ fn main() {
         "solo" => {
             let keep = match token {
                 None | Some("main") => displays.iter().find(|d| d.main).cloned().unwrap_or_else(|| fail("no main display found")),
-                Some(t) => displays.iter().find(|d| d.id == t).cloned().unwrap_or_else(|| fail(&format!("unknown target '{t}'"))),
+                Some(t) => find_display(&displays, t).cloned().unwrap_or_else(|| fail(&format!("unknown target '{t}'"))),
             };
             if !keep.active {
-                run_enable(true, std::slice::from_ref(&keep));
+                run_enable(true, std::slice::from_ref(&keep), true);
             }
             let others: Vec<DisplayInfo> = displays.iter().filter(|d| d.active && d.id != keep.id).cloned().collect();
             if others.is_empty() {
                 println!("- {} is the only active display already", keep.name);
             } else {
-                run_enable(false, &others);
+                run_enable(false, &others, true);
             }
         }
         "forget" => {

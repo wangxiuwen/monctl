@@ -4,6 +4,10 @@
 // Raw win32, zero dependencies: Shell_NotifyIconW + a hidden message window,
 // same toggles as the CLI, same last-screen guard, same state files.
 //
+// windows_subsystem keeps the tray console-free when double-clicked or
+// started from the Run key.
+#![windows_subsystem = "windows"]
+//
 // The tray runs in the logged-on user's session (display APIs are
 // session-scoped on Windows — never start it from a service context).
 
@@ -31,14 +35,6 @@ mod tray {
     type HGDIOBJ = HANDLE;
 
     #[repr(C)]
-    struct RECT {
-        l: i32,
-        t: i32,
-        r: i32,
-        b: i32,
-    }
-
-    #[repr(C)]
     struct ICONINFO {
         f_icon: BOOL,
         x_hotspot: DWORD,
@@ -56,6 +52,7 @@ mod tray {
     const WM_COMMAND: UINT = 0x0111;
     const WM_USER_TRAY: UINT = WM_APP + 1;
     const WM_HOTKEY: UINT = 0x0312;
+    const WM_TIMER: UINT = 0x0113;
     // global recovery hotkey: Ctrl+Alt+Shift+D = enable all displays
     const HOTKEY_MODS: UINT = 0x2 | 0x1 | 0x4; // MOD_CONTROL | MOD_ALT | MOD_SHIFT
     const HOTKEY_VK: UINT = 0x44; // 'D'
@@ -81,11 +78,16 @@ mod tray {
 
     // menu ids
     const ID_DISPLAY_BASE: u32 = 1000; // +index into snapshot
-    const ID_SOLO: u32 = 1;
-    const ID_ALL: u32 = 2;
-    const ID_AWAKE_BASE: u32 = 10; // +0..=3 durations, 4 = off
-    const ID_AUTOSTART: u32 = 20;
-    const ID_QUIT: u32 = 21;
+    // Fixed items live in 300..400. They used to sit at 1..21, which collided
+    // with the awake-duration items at ID_AWAKE_BASE+10..=13 (20/21/22/23):
+    // clicking "开机启动" (20) actually started a 1-hour awake hold, and
+    // "退出" (21) started a 4-hour one. Displays at 1000+ and remembered-off
+    // ghosts at 500..999 stay where they were.
+    const ID_SOLO: u32 = 300;
+    const ID_ALL: u32 = 301;
+    const ID_AWAKE_BASE: u32 = 302; // +0..=3 durations, 4 = off
+    const ID_AUTOSTART: u32 = 307;
+    const ID_QUIT: u32 = 308;
     const AWAKE_SECS: [(&str, u64); 4] = [("1 小时", 3600), ("4 小时", 14400), ("8 小时", 28800), ("不限时", 0)];
 
     #[repr(C)]
@@ -164,10 +166,6 @@ mod tray {
         fn PostMessageW(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> BOOL;
         fn GetDC(hwnd: HWND) -> HDC;
         fn ReleaseDC(hwnd: HWND, dc: HDC) -> i32;
-        fn FillRect(dc: HDC, rect: *const RECT, brush: HANDLE) -> i32;
-        fn SetBkMode(dc: HDC, mode: i32) -> i32;
-        fn SetTextColor(dc: HDC, color: u32) -> u32;
-        fn DrawTextW(dc: HDC, text: *mut WCHAR, len: i32, rect: *mut RECT, flags: UINT) -> i32;
         fn CreatePopupMenu() -> HMENU;
         fn AppendMenuW(menu: HMENU, flags: UINT, id: WPARAM, text: *const WCHAR) -> BOOL;
         fn TrackPopupMenu(menu: HMENU, flags: UINT, x: i32, y: i32, reserved: i32, hwnd: HWND, rect: *const c_void) -> BOOL;
@@ -176,6 +174,8 @@ mod tray {
         fn SetForegroundWindow(hwnd: HWND) -> BOOL;
         fn RegisterHotKey(hwnd: HWND, id: i32, modifiers: UINT, vk: UINT) -> BOOL;
         fn UnregisterHotKey(hwnd: HWND, id: i32) -> BOOL;
+        fn SetTimer(hwnd: HWND, id: usize, ms: UINT, proc: *const c_void) -> usize;
+        fn KillTimer(hwnd: HWND, id: usize) -> BOOL;
     }
 
     #[link(name = "shell32")]
@@ -186,9 +186,9 @@ mod tray {
     #[link(name = "advapi32")]
     extern "system" {
         fn RegCreateKeyExW(key: HKEY, subkey: *const WCHAR, reserved: DWORD, class: *const WCHAR, options: DWORD, access: DWORD, security: *const c_void, result: *mut HKEY, disposition: *mut DWORD) -> i32;
-        fn RegOpenKeyExW(key: HKEY, subkey: *const WCHAR, reserved: DWORD, access: DWORD, result: *mut HKEY) -> i32;
         fn RegSetValueExW(key: HKEY, name: *const WCHAR, reserved: DWORD, kind: DWORD, data: *const u8, size: DWORD) -> i32;
         fn RegDeleteValueW(key: HKEY, name: *const WCHAR) -> i32;
+        fn RegOpenKeyExW(key: HKEY, subkey: *const WCHAR, reserved: DWORD, access: DWORD, result: *mut HKEY) -> i32;
         fn RegQueryValueExW(key: HKEY, name: *const WCHAR, reserved: *const DWORD, kind: *mut DWORD, buf: *mut u8, size: *mut DWORD) -> i32;
         fn RegCloseKey(key: HKEY) -> i32;
     }
@@ -198,13 +198,11 @@ mod tray {
     #[link(name = "gdi32")]
     extern "system" {
         fn CreateCompatibleDC(dc: HDC) -> HDC;
-        fn CreateCompatibleBitmap(dc: HDC, w: i32, h: i32) -> HBITMAP;
-        fn CreateSolidBrush(color: u32) -> HANDLE;
-        fn CreateFontW(height: i32, width: i32, esc: i32, orient: i32, weight: i32, italic: DWORD, underline: DWORD, strike: DWORD, charset: DWORD, out_prec: DWORD, clip_prec: DWORD, quality: DWORD, pitch_family: DWORD, face: *const WCHAR) -> HANDLE;
         fn SelectObject(dc: HDC, obj: HGDIOBJ) -> HGDIOBJ;
         fn DeleteObject(obj: HGDIOBJ) -> BOOL;
         fn DeleteDC(dc: HDC) -> BOOL;
         fn CreateBitmap(w: i32, h: i32, planes: UINT, bits: UINT, data: *const c_void) -> HBITMAP;
+        fn SetBitmapBits(bitmap: HBITMAP, bytes: DWORD, bits: *const c_void) -> i32;
     }
 
     #[link(name = "user32")]
@@ -218,49 +216,123 @@ mod tray {
         fn IsProcessInJob(process: HANDLE, job: HANDLE, result: *mut BOOL) -> BOOL;
     }
 
-    /// A recognizable tray icon: blue rounded square with a white "M".
-    /// (The stock IDI_APPLICATION white window is invisible among real apps.)
+    #[repr(C)]
+    struct BITMAPINFOHEADER {
+        bi_size: DWORD,
+        bi_width: i32,
+        bi_height: i32,
+        bi_planes: u16,
+        bi_bit_count: u16,
+        bi_compression: DWORD,
+        bi_size_image: DWORD,
+        bi_x_pels_per_meter: DWORD,
+        bi_y_pels_per_meter: DWORD,
+        bi_clr_used: DWORD,
+        bi_clr_important: DWORD,
+    }
+
+    #[repr(C)]
+    struct BITMAPINFO {
+        header: BITMAPINFOHEADER,
+    }
+
+    const BI_RGB: DWORD = 0;
+    const DIB_RGB_COLORS: UINT = 0;
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn CreateDIBSection(dc: HDC, bmi: *const BITMAPINFO, usage: UINT, bits: *mut *mut c_void, section: HANDLE, offset: DWORD) -> HBITMAP;
+        fn CreatePen(style: i32, width: i32, color: u32) -> HANDLE;
+        fn CreateSolidBrush(color: u32) -> HANDLE;
+        fn Rectangle(dc: HDC, l: i32, t: i32, r: i32, b: i32) -> BOOL;
+        fn GetStockObject(index: i32) -> HGDIOBJ;
+    }
+
+    const PS_SOLID: i32 = 0;
+    const NULL_BRUSH: i32 = 5;
+
+    /// A recognizable tray icon matching the macOS template style (and native
+    /// Windows tray glyphs): two outlined displays on a transparent
+    /// background, drawn white.
+    ///
+    /// Drawn into a 32bpp DIB section. GDI never writes the alpha lane, so
+    /// afterwards alpha is derived from pixel luminance: white strokes become
+    /// opaque, the untouched background stays fully transparent, and antialiased
+    /// edges get partial coverage. A plain DDB (or an uninitialized AND mask)
+    /// instead renders as a blob — or not at all.
     unsafe fn make_icon() -> HICON {
-        let size = 32;
+        let size = 32i32;
         let dc_screen = GetDC(std::ptr::null_mut());
         let mem = CreateCompatibleDC(dc_screen);
-        let bmp = CreateCompatibleBitmap(dc_screen, size, size);
-        let old_bmp = SelectObject(mem, bmp);
 
-        let brush = CreateSolidBrush(0x00E6_6C1E); // RGB(30,108,230) as COLORREF
-        let rect = RECT { l: 0, t: 0, r: size, b: size };
-        FillRect(mem, &rect, brush);
-        DeleteObject(brush);
+        let bmi = BITMAPINFO {
+            header: BITMAPINFOHEADER {
+                bi_size: std::mem::size_of::<BITMAPINFOHEADER>() as DWORD,
+                bi_width: size,
+                bi_height: -size, // top-down
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: BI_RGB,
+                bi_size_image: 0,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            },
+        };
+        let mut px: *mut u8 = std::ptr::null_mut();
+        let dib = CreateDIBSection(dc_screen, &bmi, DIB_RGB_COLORS, std::ptr::addr_of_mut!(px) as *mut *mut c_void, std::ptr::null_mut(), 0);
+        let old_bmp = SelectObject(mem, dib);
 
-        let font = CreateFontW(-22, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0, wide("Segoe UI").as_ptr());
-        let old_font = SelectObject(mem, font);
-        SetBkMode(mem, 1); // TRANSPARENT
-        SetTextColor(mem, 0x00FF_FFFF);
-        let mut tr = RECT { l: 0, t: 2, r: size, b: size };
-        let mut text = wide("M");
-        DrawTextW(mem, text.as_mut_ptr(), 1, &mut tr, 0x1 | 0x4 | 0x20); // CENTER|VCENTER|SINGLELINE
-        SelectObject(mem, old_font);
-        DeleteObject(font);
+        // transparent background: the freshly zeroed DIB stays untouched
+        let pen = CreatePen(PS_SOLID, 2, 0x00FF_FFFF); // white COLORREF
+        let black = CreateSolidBrush(0x0000_0000);
+        let null_brush = GetStockObject(NULL_BRUSH);
+        let old_pen = SelectObject(mem, pen);
+        // back display (right, smaller), drawn first...
+        SelectObject(mem, null_brush);
+        Rectangle(mem, 18, 5, 30, 16);
+        // ...front display (left, larger): its opaque-black fill occludes the
+        // back strokes inside its silhouette (the alpha pass turns black into
+        // transparency), so the pair reads as stacked front-to-back like the
+        // macOS `display.2` symbol instead of two touching rectangles.
+        SelectObject(mem, black);
+        Rectangle(mem, 2, 10, 22, 25);
+        SelectObject(mem, old_pen);
+        DeleteObject(pen);
+        DeleteObject(black);
+
+        // alpha = coverage (white strokes on transparent black); force RGB to white
+        if !px.is_null() {
+            let pixels = std::slice::from_raw_parts_mut(px, (size * size * 4) as usize);
+            for i in 0..(size * size) as usize {
+                let (b, g, r) = (pixels[i * 4] as u32, pixels[i * 4 + 1] as u32, pixels[i * 4 + 2] as u32);
+                let coverage = b.max(g).max(r).min(255) as u8;
+                pixels[i * 4] = 0xFF;
+                pixels[i * 4 + 1] = 0xFF;
+                pixels[i * 4 + 2] = 0xFF;
+                pixels[i * 4 + 3] = coverage;
+            }
+        }
 
         SelectObject(mem, old_bmp);
         DeleteDC(mem);
         ReleaseDC(std::ptr::null_mut(), dc_screen);
 
+        // AND mask all-zero = transparency comes from the alpha lane alone.
         let mask = CreateBitmap(size, size, 1, 1, std::ptr::null());
-        let ii = ICONINFO { f_icon: 1, x_hotspot: 0, y_hotspot: 0, mask, color: bmp };
+        let zeros = [0u8; (32 * 32 / 8) as usize];
+        SetBitmapBits(mask, zeros.len() as DWORD, zeros.as_ptr() as *const c_void);
+
+        let ii = ICONINFO { f_icon: 1, x_hotspot: 0, y_hotspot: 0, mask, color: dib };
         let icon = CreateIconIndirect(&ii);
-        DeleteObject(bmp);
+        DeleteObject(dib);
         DeleteObject(mask);
         icon
     }
 
     fn wide(s: &str) -> Vec<WCHAR> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    fn from_wide(w: &[WCHAR]) -> String {
-        let len = w.iter().position(|&c| c == 0).unwrap_or(w.len());
-        String::from_utf16_lossy(&w[..len])
     }
 
     // ---- tray state (single UI thread) ----
@@ -289,12 +361,20 @@ mod tray {
 
     fn autostart_enabled() -> bool {
         let (key, name) = run_key();
-        let mut kind: DWORD = 0;
-        let mut size: DWORD = 0;
-        let ok = unsafe {
-            RegQueryValueExW(key, wide(&name).as_ptr(), std::ptr::null(), &mut kind, std::ptr::null_mut(), &mut size) == 0
-        };
-        ok
+        unsafe {
+            let mut hk: HKEY = std::ptr::null_mut();
+            // Querying a value directly on the HKCU predefined handle returned
+            // ERROR_FILE_NOT_FOUND even when the value existed (verified side
+            // by side: open-then-query succeeds). Always open the Run key first.
+            if RegOpenKeyExW(key, wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run").as_ptr(), 0, KEY_QUERY_VALUE, &mut hk) != 0 {
+                return false;
+            }
+            let mut kind: DWORD = 0;
+            let mut size: DWORD = 0;
+            let rc = RegQueryValueExW(hk, wide(&name).as_ptr(), std::ptr::null(), &mut kind, std::ptr::null_mut(), &mut size);
+            RegCloseKey(hk);
+            rc == 0 || rc == 234 // ERROR_SUCCESS / ERROR_MORE_DATA both mean it exists
+        }
     }
 
     fn set_autostart(on: bool) {
@@ -333,7 +413,8 @@ mod tray {
         }
     }
 
-    fn awake_remaining() -> Option<u64> {
+    /// (remaining_secs, requested_secs) of a live awake hold.
+    fn awake_state() -> Option<(u64, u64)> {
         let p = common::awake_path();
         let s = std::fs::read_to_string(p).ok()?;
         let get = |k: &str| -> Option<u64> {
@@ -354,12 +435,87 @@ mod tray {
         if now.saturating_sub(heartbeat) > 15 {
             return None;
         }
-        Some(get("deadline")?.saturating_sub(now))
+        Some((get("deadline")?.saturating_sub(now), get("requested").unwrap_or(0)))
     }
 
     fn fmt_secs(s: u64) -> String {
         let (h, m) = (s / 3600, (s % 3600) / 60);
         if h > 0 { format!("{h}h{m:02}m") } else { format!("{m}m") }
+    }
+
+    /// Show a tray balloon. Failures and setting changes must be visible —
+    /// silent background threads are how "点了没反应" happens.
+    unsafe fn notify(hwnd: HWND, title: &str, body: &str) {
+        let mut n = NOTIFYICONDATAW::new(hwnd);
+        n.uflags |= NIF_INFO;
+        n.info_flags = 0x1; // NIIF_INFO
+        let t = wide(title);
+        let tl = t.len().min(63);
+        n.info_title[..tl].copy_from_slice(&t[..tl]);
+        let b = wide(body);
+        let bl = b.len().min(255);
+        n.info[..bl].copy_from_slice(&b[..bl]);
+        Shell_NotifyIconW(NIM_MODIFY, &mut n);
+    }
+
+    /// Hover tooltip = always-visible state line: screen count, secondary
+    /// display on/off, awake hold remaining.
+    unsafe fn refresh_tooltip(hwnd: HWND) {
+        let displays = monctl::windows::list();
+        let active = displays.iter().filter(|d| d.active).count();
+        let secondary_on = displays.iter().any(|d| d.active && !d.main);
+        let mut tip = format!("monctl · {active} 块屏 · 副屏{}", if secondary_on { "开" } else { "关" });
+        if let Some((r, _)) = awake_state() {
+            tip.push_str(&format!(" · 防休眠 {}", fmt_secs(r)));
+        }
+        tip.push_str("（左键开关副屏，右键菜单）");
+        let mut n = NOTIFYICONDATAW::new(hwnd);
+        n.uflags |= NIF_TIP;
+        let t = wide(&tip);
+        let tl = t.len().min(127);
+        n.tip[..tl].copy_from_slice(&t[..tl]);
+        Shell_NotifyIconW(NIM_MODIFY, &mut n);
+    }
+
+    /// Left-click action: flip the secondary display. If one is on, close it;
+    /// otherwise bring back every remembered/off display. The one command
+    /// remote workers actually need, one click away.
+    unsafe fn toggle_secondary(hwnd: HWND) {
+        let displays = monctl::windows::list();
+        let active_count = displays.iter().filter(|d| d.active).count();
+        let secondary = displays.iter().find(|d| d.active && !d.main).cloned();
+        match secondary {
+            Some(d) if active_count > 1 => {
+                match monctl::windows::set_enabled(&d.id, false) {
+                    Ok(()) => {
+                        let mut st = common::load_state();
+                        st.insert(d.id.clone(), d.name.clone());
+                        common::save_state(&st);
+                        notify(hwnd, "monctl", &format!("已关闭 {}", d.name));
+                    }
+                    Err(e) => {
+                        let log = common::state_path().with_file_name("tray-error.log");
+                        let _ = std::fs::write(log, format!("{e}\n"));
+                        notify(hwnd, &format!("关闭 {} 失败", d.name), &e);
+                    }
+                }
+            }
+            _ => {
+                let state = common::load_state();
+                let mut restored = 0usize;
+                for id in state.keys() {
+                    if monctl::windows::set_enabled(id, true).is_ok() {
+                        let mut st = common::load_state();
+                        st.remove(id);
+                        common::save_state(&st);
+                        restored += 1;
+                    }
+                }
+                let msg = if restored > 0 { format!("已开启 {restored} 块屏") } else { "没有副屏可操作".to_string() };
+                notify(hwnd, "monctl", &msg);
+            }
+        }
+        refresh_tooltip(hwnd);
     }
 
     unsafe fn build_menu(displays: &[DisplayInfo], remember: &OffState) -> (HMENU, bool) {
@@ -380,10 +536,15 @@ mod tray {
             } else {
                 format!("开启  {}", d.name)
             };
-            if d.main && d.active {
-                title.push_str("（主屏）");
-            }
             let mut flags = MF_STRING;
+            if d.active && d.main {
+                // Windows drivers may allow detaching the primary but refuse
+                // the re-attach (NVIDIA实测 DISP_CHANGE_FAILED), and the OS
+                // has no CCD path left to recover it — the screen stays dark
+                // until reboot. Never offer it.
+                title.push_str("（主屏不可关闭）");
+                flags |= MF_GRAYED;
+            }
             if d.active && active_count <= 1 {
                 title.push_str(" — 最后一块，不能关");
                 flags |= MF_GRAYED;
@@ -406,16 +567,22 @@ mod tray {
         AppendMenuW(menu, all_flags, ID_ALL as WPARAM, wide("全部开启 (Ctrl+Alt+Shift+D)").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
 
-        let remaining = awake_remaining();
-        let awake_label = match remaining {
-            Some(r) => format!("保持唤醒（剩余 {}）", fmt_secs(r)),
+        let awake = awake_state();
+        let awake_label = match awake {
+            Some((r, _)) => format!("保持唤醒（剩余 {}）", fmt_secs(r)),
             None => "保持唤醒".to_string(),
         };
         AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_AWAKE_BASE as WPARAM, wide(&awake_label).as_ptr());
-        for (i, (label, _)) in AWAKE_SECS.iter().enumerate() {
-            AppendMenuW(menu, MF_STRING, (ID_AWAKE_BASE + 10 + i as u32) as WPARAM, wide(label).as_ptr());
+        for (i, (label, secs)) in AWAKE_SECS.iter().enumerate() {
+            // tick the duration currently on hold (互斥单选)
+            let checked = match awake {
+                Some((_, requested)) => requested == *secs,
+                None => false,
+            };
+            let flags = MF_STRING | if checked { MF_CHECKED } else { 0 };
+            AppendMenuW(menu, flags, (ID_AWAKE_BASE + 10 + i as u32) as WPARAM, wide(label).as_ptr());
         }
-        let off_flags = MF_STRING | if remaining.is_some() { 0 } else { MF_GRAYED };
+        let off_flags = MF_STRING | if awake.is_some() { 0 } else { MF_GRAYED };
         AppendMenuW(menu, off_flags, (ID_AWAKE_BASE + 14) as WPARAM, wide("解除保持").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
 
@@ -434,11 +601,27 @@ mod tray {
             let ids: Vec<String> = remember.keys().cloned().collect();
             if let Some(key) = ids.get(pos) {
                 let key = key.clone();
+                let name = remember.get(&key).cloned().unwrap_or_else(|| key.clone());
+                let hwnd_addr = hwnd as usize;
                 std::thread::spawn(move || {
-                    let _ = monctl::windows::set_enabled(&key, true);
-                    let mut st = common::load_state();
-                    st.remove(&key);
-                    common::save_state(&st);
+                    let hwnd = hwnd_addr as HWND;
+                    match monctl::windows::set_enabled(&key, true) {
+                        Ok(()) => {
+                            let mut st = common::load_state();
+                            st.remove(&key);
+                            common::save_state(&st);
+                            unsafe {
+                                notify(hwnd, "monctl", &format!("已开启 {name}"));
+                                refresh_tooltip(hwnd);
+                            }
+                        }
+                        Err(e) => {
+                            // keep the state entry so the display stays recoverable
+                            let log = common::state_path().with_file_name("tray-error.log");
+                            let _ = std::fs::write(log, format!("{e}\n"));
+                            unsafe { notify(hwnd, &format!("开启 {name} 失败"), &format!("{e}\n（重新插拔显示器线、注销重登或重启后可用「全部开启」找回）")); }
+                        }
+                    }
                 });
             }
             return;
@@ -448,10 +631,13 @@ mod tray {
             let idx = (id - ID_DISPLAY_BASE) as usize;
             if let Some(d) = ui.snapshot.get(idx) {
                 let d = d.clone();
+                let hwnd_addr = hwnd as usize;
                 std::thread::spawn(move || {
+                    let hwnd = hwnd_addr as HWND;
                     if d.active && monctl::windows::list().iter().filter(|x| x.active).count() <= 1 {
                         return; // last-screen guard (menu item is grayed; belt & suspenders)
                     }
+                    let turning_off = d.active;
                     match monctl::windows::set_enabled(&d.id, !d.active) {
                         Ok(()) => {
                             let mut st = common::load_state();
@@ -461,11 +647,19 @@ mod tray {
                                 st.remove(&d.id);
                             }
                             common::save_state(&st);
+                            let verb = if turning_off { "已关闭" } else { "已开启" };
+                            unsafe {
+                                notify(hwnd, "monctl", &format!("{verb} {}", d.name));
+                                refresh_tooltip(hwnd);
+                            }
                         }
                         Err(e) => {
-                            // keep a trace; a balloon would be overkill for a background toggle
                             let log = common::state_path().with_file_name("tray-error.log");
                             let _ = std::fs::write(log, format!("{e}\n"));
+                            let verb = if turning_off { "关闭" } else { "开启" };
+                            unsafe {
+                                notify(hwnd, &format!("{verb} {} 失败", d.name), &format!("{e}\n（部分驱动不允许此操作，主屏尤其常见）"));
+                            }
                         }
                     }
                 });
@@ -508,11 +702,39 @@ mod tray {
                 } else {
                     spawn_monctl(&["awake", &secs.to_string()]);
                 }
+                let label = AWAKE_SECS[(i - ID_AWAKE_BASE - 10) as usize].0.to_string();
+                unsafe {
+                    notify(hwnd, "保持唤醒", &format!("已选择 {label}，防休眠生效中"));
+                }
+                // awake.json is written by the spawned monctl ~0.7s later;
+                // refresh the tooltip once that state is on disk
+                let hwnd_addr = hwnd as usize;
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    unsafe { refresh_tooltip(hwnd_addr as HWND) };
+                });
             }
-            i if i == ID_AWAKE_BASE + 14 => spawn_monctl(&["awake", "off"]),
+            i if i == ID_AWAKE_BASE + 14 => {
+                spawn_monctl(&["awake", "off"]);
+                unsafe {
+                    notify(hwnd, "保持唤醒", "已解除");
+                }
+                let hwnd_addr = hwnd as usize;
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    unsafe { refresh_tooltip(hwnd_addr as HWND) };
+                });
+            }
             ID_AUTOSTART => {
                 let on = !autostart_enabled();
                 set_autostart(on);
+                unsafe {
+                    if on {
+                        notify(hwnd, "monctl 开机启动", &format!("已开启：登录后自动运行 {}", exe_path().display()));
+                    } else {
+                        notify(hwnd, "monctl 开机启动", "已关闭");
+                    }
+                }
             }
             ID_QUIT => {
                 UnregisterHotKey(hwnd, 1);
@@ -527,12 +749,37 @@ mod tray {
     unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT {
         // explorer/taskbar restarted: re-register the icon or it silently disappears
         if msg == taskbar_created_msg() {
-            readd_icon(hwnd);
+            add_icon_with_retry(hwnd);
+            return 0;
+        }
+        if msg == WM_TIMER && wp == RETRY_TIMER_ID {
+            if add_icon(hwnd) {
+                KillTimer(hwnd, RETRY_TIMER_ID);
+            }
+            return 0;
+        }
+        if msg == WM_TIMER && wp == REFRESH_TIMER_ID {
+            KillTimer(hwnd, REFRESH_TIMER_ID);
+            // Boot race, part two: even a "successful" NIM_ADD during explorer
+            // startup can land in a shell that never binds it — the icon exists
+            // in the data layer but the taskbar never draws it. A delete +
+            // re-add once the desktop is fully up forces the bind.
+            let mut n = NOTIFYICONDATAW::new(hwnd);
+            Shell_NotifyIconW(NIM_DELETE, &mut n);
+            add_icon_with_retry(hwnd);
             return 0;
         }
         if msg == WM_USER_TRAY {
             let up = lp as DWORD as UINT;
-            if up == WM_LBUTTONUP || up == WM_RBUTTONUP {
+            if up == WM_LBUTTONUP {
+                // left = the everyday command: flip the secondary display
+                let hwnd_addr = hwnd as usize;
+                std::thread::spawn(move || unsafe {
+                    toggle_secondary(hwnd_addr as HWND);
+                });
+                return 0;
+            }
+            if up == WM_RBUTTONUP {
                 UI.with(|u| {
                     let mut ui = u.borrow_mut();
                     ui.snapshot = monctl::windows::list();
@@ -582,13 +829,29 @@ mod tray {
         MSG.with(|m| *m)
     }
 
-    unsafe fn readd_icon(hwnd: HWND) {
+    /// (Re-)register the tray icon. Returns whether the shell accepted it.
+    unsafe fn add_icon(hwnd: HWND) -> bool {
         let mut n = NOTIFYICONDATAW::new(hwnd);
         n.icon = make_icon();
         let tip = wide("monctl");
         let tlen = tip.len().min(127);
         n.tip[..tlen].copy_from_slice(&tip[..tlen]);
-        Shell_NotifyIconW(NIM_ADD, &mut n);
+        Shell_NotifyIconW(NIM_ADD, &mut n) != 0
+    }
+
+    const RETRY_TIMER_ID: usize = 1;
+    const REFRESH_TIMER_ID: usize = 2;
+
+    /// The taskbar broadcasts TaskbarCreated very early during explorer
+    /// startup, sometimes before its tray is ready to accept icons — a
+    /// fire-and-forget NIM_ADD is silently dropped and the icon never
+    /// appears (the classic "autostart tray missing" race). Keep retrying
+    /// every 500 ms until the shell takes it.
+    unsafe fn add_icon_with_retry(hwnd: HWND) {
+        if add_icon(hwnd) {
+            return;
+        }
+        SetTimer(hwnd, RETRY_TIMER_ID, 500, std::ptr::null_mut());
     }
 
     /// Scheduled-task instances run inside the task's job object; deleting the
@@ -662,14 +925,15 @@ mod tray {
             if hwnd.is_null() {
                 return std::process::ExitCode::FAILURE;
             }
-            let mut n = NOTIFYICONDATAW::new(hwnd);
-            n.icon = make_icon();
-            let tip = wide("monctl");
-            let tlen = tip.len().min(127);
-            n.tip[..tlen].copy_from_slice(&tip[..tlen]);
-            if Shell_NotifyIconW(NIM_ADD, &mut n) == 0 {
-                return std::process::ExitCode::FAILURE;
+            if !add_icon(hwnd) {
+                // most common at logon: the tray autostarts while explorer is
+                // still booting. Retry until the shell accepts the icon
+                // instead of giving up (and "losing" the tray icon).
+                SetTimer(hwnd, RETRY_TIMER_ID, 500, std::ptr::null_mut());
             }
+            // And even an accepted NIM_ADD during boot may end up unbound (the
+            // taskbar never draws it). Re-register once the desktop settles.
+            SetTimer(hwnd, REFRESH_TIMER_ID, 12_000, std::ptr::null_mut());
             // one-shot balloon so people can locate the icon (often hidden in the ^ overflow)
             let mut b = NOTIFYICONDATAW::new(hwnd);
             b.uflags |= NIF_INFO;
@@ -677,12 +941,13 @@ mod tray {
             let title = wide("monctl 托盘已启动");
             let t = title.len().min(63);
             b.info_title[..t].copy_from_slice(&title[..t]);
-            let body = wide("图标在任务栏右下角（可能在 ^ 溢出区里的蓝色 M）。右键它管理屏幕和防休眠；Ctrl+Alt+Shift+D 恢复全部显示器。");
+            let body = wide("左键开关副屏；右键管理屏幕和防休眠；Ctrl+Alt+Shift+D 恢复全部显示器。");
             let bl = body.len().min(255);
             b.info[..bl].copy_from_slice(&body[..bl]);
             Shell_NotifyIconW(NIM_MODIFY, &mut b);
             UI.with(|u| u.borrow_mut().hwnd = hwnd);
             RegisterHotKey(hwnd, 1, HOTKEY_MODS, HOTKEY_VK);
+            refresh_tooltip(hwnd);
 
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {

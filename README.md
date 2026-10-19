@@ -131,8 +131,26 @@ cleared on reboot anyway).
   as the CLI.
 - **Windows tray**: built from the same repo — `cargo build --release` produces
   `monctl-tray.exe` next to `monctl.exe` (pure win32, no dependencies). Same
-  menus, plus an autostart toggle backed by the `HKCU …\Run` registry key.
-  Like all Windows display APIs it must run in the logged-on user's session.
+  menus, plus an autostart toggle backed by the `HKCU …\Run` registry key and a
+  global recovery hotkey **Ctrl+Alt+Shift+D** (re-enables every display — for
+  when you turned off the wrong one from a blind remote session). Like all
+  Windows display APIs it must run in the logged-on user's session.
+
+### Windows troubleshooting
+
+- **Tray icon doesn't show up**: Win11 sometimes skips rendering newly
+  registered tray icons (the icon IS registered — check the `^` overflow area
+  for the blue M). Signing out/in or restarting "Windows Explorer" in Task
+  Manager makes it appear.
+- **Empty `monctl list` over SSH / from a service**: display APIs are
+  session-scoped on Windows. Hop into the console session with
+  [`extras/windows-session-run.cmd`](extras/windows-session-run.cmd).
+- **The primary display cannot be turned off**: Windows drivers generally
+  accept detaching the primary display but refuse the re-attach
+  (DISP_CHANGE_FAILED on NVIDIA), leaving it dark until reboot. monctl refuses
+  it in both the CLI and the tray; close a secondary display instead.
+- **Display ids**: both `monctl off DISPLAY2` and `monctl off \\.\DISPLAY2`
+  work; copy straight from `monctl list` output.
 - **Running monctl on a headless Windows box over remote exec** (winforge,
   SSH-as-SYSTEM, …): the service context cannot see displays, so hop into the
   console session with a one-shot scheduled task — template in

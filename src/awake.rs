@@ -20,6 +20,7 @@ struct Hold {
     heartbeat: u64,
     display: bool,
     release: bool,
+    requested: u64, // originally requested duration (0 = until released); tray uses it to tick the active menu item
 }
 
 fn now() -> u64 {
@@ -35,6 +36,7 @@ fn read_hold() -> Option<Hold> {
         heartbeat: map.get("heartbeat")?.parse().ok()?,
         display: map.get("display").map(|s| s == "1").unwrap_or(false),
         release: map.get("release").map(|s| s == "1").unwrap_or(false),
+        requested: map.get("requested").and_then(|s| s.parse().ok()).unwrap_or(0),
     })
 }
 
@@ -45,6 +47,7 @@ fn write_hold(h: &Hold) {
     map.insert("heartbeat".to_string(), h.heartbeat.to_string());
     map.insert("display".to_string(), if h.display { "1" } else { "0" }.to_string());
     map.insert("release".to_string(), if h.release { "1" } else { "0" }.to_string());
+    map.insert("requested".to_string(), h.requested.to_string());
     let path = crate::common::awake_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -322,6 +325,7 @@ fn hold(secs: u64, display: bool) {
             let mut h = existing;
             h.deadline = deadline;
             h.heartbeat = now();
+            h.requested = secs;
             write_hold(&h);
             report(secs, display);
             return;
@@ -335,7 +339,7 @@ fn hold(secs: u64, display: bool) {
     };
     // give the holder a moment to take over and start heartbeating
     thread::sleep(Duration::from_millis(700));
-    write_hold(&Hold { holder_pid, deadline, heartbeat: now(), display, release: false });
+    write_hold(&Hold { holder_pid, deadline, heartbeat: now(), display, release: false, requested: secs });
     report(secs, display);
     fn report(secs: u64, display: bool) {
         if secs >= FOREVER_SECS {

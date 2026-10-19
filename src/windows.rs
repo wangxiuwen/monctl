@@ -22,6 +22,7 @@ const DISPLAY_DEVICE_MIRRORING_DRIVER: DWORD = 0x0000_0008;
 const DM_POSITION: DWORD = 0x0000_0020;
 const DM_PELSWIDTH: DWORD = 0x0008_0000;
 const DM_PELSHEIGHT: DWORD = 0x0010_0000;
+const DM_DISPLAYFREQUENCY: DWORD = 0x0040_0000;
 const CDS_UPDATEREGISTRY: DWORD = 0x0000_0001;
 const CDS_NORESET: DWORD = 0x1000_0000;
 const DISP_CHANGE_SUCCESSFUL: LONG = 0;
@@ -46,10 +47,17 @@ struct DevModePrinter {
     dm_print_quality: i16,
 }
 
+// DEVMODEW must match the winuser.h layout byte for byte: dmPosition /
+// dmDisplayOrientation / dmDisplayFixedOutput are alternatives in the SAME
+// union as the printer fields, not separate fields after it. Getting this
+// wrong shifts every later member and makes ChangeDisplaySettingsExW fail
+// with DISP_CHANGE_BADMODE on real drivers.
 #[repr(C)]
 union DevModeU {
     printer: DevModePrinter,
-    display_frequency: DWORD,
+    position: POINTL,
+    display_orientation: DWORD,
+    display_fixed_output: DWORD,
 }
 
 #[repr(C)]
@@ -67,9 +75,6 @@ struct DEVMODEW {
     dm_driver_extra: u16,
     dm_fields: DWORD,
     u: DevModeU,
-    dm_position: POINTL,
-    dm_display_orientation: DWORD,
-    dm_display_fixed_output: DWORD,
     dm_color: i16,
     dm_duplex: i16,
     dm_y_resolution: i16,
@@ -100,6 +105,8 @@ impl DEVMODEW {
         dm
     }
 }
+
+const _: () = assert!(std::mem::size_of::<DEVMODEW>() == 220); // x64 SDK layout
 
 #[repr(C)]
 struct DISPLAY_DEVICEW {
@@ -169,21 +176,36 @@ fn current_settings(device: &str) -> Option<DEVMODEW> {
     }
 }
 
-/// First registry mode with real dimensions — fallback for devices whose
-/// "current settings" are zeroed (phantom outputs), so a re-attach can never
-/// apply a 0x0 mode and kill a screen for good.
+/// Best registry mode with real dimensions — fallback for devices whose
+/// "current settings" are zeroed (detached or phantom outputs), so a re-attach
+/// can never apply a 0x0 mode and kill a screen for good. Among modes with the
+/// largest area, prefer the highest refresh rate — mode 0 is often 50 Hz, and
+/// silently dropping a 60 Hz panel to 50 Hz on re-attach is a bad surprise.
 fn any_real_mode(device: &str) -> Option<DEVMODEW> {
     let wide = string_to_wide(device);
+    let mut best: Option<DEVMODEW> = None;
     for i in 0..200u32 {
         let mut dm = DEVMODEW::new();
         if unsafe { EnumDisplaySettingsW(wide.as_ptr(), i, &mut dm) } == 0 {
             break;
         }
-        if dm.dm_pels_width > 0 && dm.dm_pels_height > 0 {
-            return Some(dm);
+        if dm.dm_pels_width == 0 || dm.dm_pels_height == 0 {
+            continue;
         }
+        best = Some(match best {
+            None => dm,
+            Some(b) => {
+                let area = dm.dm_pels_width as u64 * dm.dm_pels_height as u64;
+                let best_area = b.dm_pels_width as u64 * b.dm_pels_height as u64;
+                if area > best_area || (area == best_area && dm.dm_display_frequency > b.dm_display_frequency) {
+                    dm
+                } else {
+                    b
+                }
+            }
+        });
     }
-    None
+    best
 }
 
 /// EDID monitor name attached to an adapter ("DELL P2314H"), falling back to
@@ -212,10 +234,10 @@ pub fn list() -> Vec<DisplayInfo> {
                     if dm.dm_pels_width == 0 || dm.dm_pels_height == 0 {
                         return "n/a".to_string();
                     }
-                    let hz = unsafe { dm.u.display_frequency };
+                    let hz = dm.dm_display_frequency;
+                    let (x, y) = unsafe { (dm.u.position.x, dm.u.position.y) };
                     let r = if hz > 1 { format!(" @{}Hz", hz) } else { String::new() };
-                    format!("{}x{}{} ({},{})",
-                        dm.dm_pels_width, dm.dm_pels_height, r, dm.dm_position.x, dm.dm_position.y)
+                    format!("{}x{}{} ({},{})", dm.dm_pels_width, dm.dm_pels_height, r, x, y)
                 })
                 .unwrap_or_else(|| "n/a".into());
             let name = monitor_name(&device).unwrap_or(description);
@@ -248,6 +270,35 @@ fn apply(device: Option<&str>, dm: &mut DEVMODEW) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether this device can be re-attached at all: it has a usable current or
+/// stored mode. Phantom outputs (GPU heads / virtual adapters with no panel)
+/// have none and would fail attach with "no usable stored mode" — `monctl all`
+/// skips those quietly instead of erroring on each.
+pub fn can_attach(id: &str) -> bool {
+    current_settings(id)
+        .filter(|dm| dm.dm_pels_width > 0 && dm.dm_pels_height > 0)
+        .is_some()
+        || any_real_mode(id).is_some()
+}
+
+/// Highest refresh rate the device advertises at exactly this resolution.
+/// Detaching can leave the driver's "current" mode at a low-refresh entry
+/// (e.g. 1920x1080@50 on a 60 Hz panel); re-attach should never downgrade.
+fn best_frequency_at(device: &str, width: DWORD, height: DWORD) -> Option<DWORD> {
+    let wide = string_to_wide(device);
+    let mut best = None;
+    for i in 0..200u32 {
+        let mut dm = DEVMODEW::new();
+        if unsafe { EnumDisplaySettingsW(wide.as_ptr(), i, &mut dm) } == 0 {
+            break;
+        }
+        if dm.dm_pels_width == width && dm.dm_pels_height == height {
+            best = Some(best.map_or(dm.dm_display_frequency, |b: DWORD| b.max(dm.dm_display_frequency)));
+        }
+    }
+    best
+}
+
 pub fn set_enabled(id: &str, enable: bool) -> Result<(), String> {
     if !id.starts_with("\\\\.\\DISPLAY") {
         return Err(format!("'{id}' is not a valid Windows display id (expected \\\\.\\DISPLAYn, see `monctl list`)"));
@@ -258,16 +309,23 @@ pub fn set_enabled(id: &str, enable: bool) -> Result<(), String> {
             Some(dm) => dm,
             None => any_real_mode(id).ok_or_else(|| format!("no usable stored mode for {id} — cannot re-attach it"))?,
         };
+        // never re-attach below what the panel advertises at this resolution
+        if let Some(hz) = best_frequency_at(id, dm.dm_pels_width, dm.dm_pels_height) {
+            if hz > dm.dm_display_frequency {
+                dm.dm_display_frequency = hz;
+                dm.dm_fields |= DM_DISPLAYFREQUENCY;
+            }
+        }
         let right_edge = list()
             .iter()
             .filter(|d| d.active)
             .filter_map(|d| current_settings(&d.id))
             .filter(|dm| dm.dm_pels_width > 0)
-            .map(|dm| dm.dm_position.x + dm.dm_pels_width as i32)
+            .map(|dm| unsafe { dm.u.position.x } + dm.dm_pels_width as i32)
             .max()
             .unwrap_or(0);
-        dm.dm_fields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
-        dm.dm_position = POINTL { x: right_edge, y: 0 };
+        dm.dm_fields |= DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+        dm.u.position = POINTL { x: right_edge, y: 0 }; // writing a union field is safe; only reads are unsafe
         apply(Some(id), &mut dm)
     } else {
         // detach: zero-sized mode is the documented "pull the cable" trick

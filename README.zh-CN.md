@@ -98,6 +98,27 @@ macOS 的 id 是数字、重启后会变（反正重启后关闭状态也清空�
   逐屏开关，带「只留主屏」和同样的最后一块屏保护。编译：
   `swiftc -O macos-tray/tray.swift -o ~/bin/monctl-tray`。与 CLI 共享同一份
   状态文件。
+- **Windows 托盘**：`cargo build --release` 时会一起产出
+  `target/release/monctl-tray.exe`（win32 原生，零依赖）。双击运行，右键
+  图标即可逐屏开关、只留主屏、保持唤醒（防休眠）和开机自启；全局热键
+  **Ctrl+Alt+Shift+D** 一键恢复全部显示器（屏幕全关时的盲操作保命符）。
+  注意在登录用户的会话里运行（远程场景用
+  [`extras/windows-session-run.cmd`](extras/windows-session-run.cmd) 跳进
+  控制台会话）。
+
+### Windows 故障排查
+
+- **托盘图标没出现**：Win11 任务栏偶尔不渲染新注册的托盘图标（图标其实已
+  注册，右下角 `^` 溢出区里找找蓝色 M）。注销重登或重启「Windows 资源管理
+  器」（任务管理器 → 右键 Windows 资源管理器 → 重新启动）即可显示。
+- **远程/服务上下文里 `monctl list` 为空**：显示 API 是会话级的，SYSTEM
+  任务计划里跑看不到屏幕；用上面的 `windows-session-run.cmd` 跳进登录用户
+  的会话再执行。
+- **主屏无法关闭**：Windows 显卡驱动普遍允许分离主屏，但**拒绝重新挂载**
+  （NVIDIA 实测返回 DISP_CHANGE_FAILED），关掉后无法程序化找回，只能重启。
+  monctl 已在 CLI 与托盘里同时禁止关闭主屏，只关副屏即可。
+- **id 带 `\\.\` 前缀**：`monctl off DISPLAY2` 和 `monctl off \\.\DISPLAY2`
+  都可以，`monctl list` 的输出可直接抄。
 
 ## 构建
 
