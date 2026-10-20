@@ -1,14 +1,14 @@
-# monctl
+# monctl（中文说明）
 
-Turn individual displays on/off from the command line — as if the cable were pulled.
+简体中文 · [English](README.en.md)
 
-macOS / Windows / Linux. Single static binary, zero dependencies.
+用一条命令把单个显示器「关掉」——效果等同拔线。
 
-Use case: your Mac/PC sits on a desk with two external screens, and you remote into
-it. Screen sharing only needs one screen, but the OS keeps both active — so you
-end up switching monitors in the remote session. `monctl off` collapses the
-desktop to a single screen before you connect; `monctl all` brings everything
-back when you're at the desk.
+支持 macOS / Windows / Linux，单个静态二进制，零依赖。
+
+典型场景：主机接着两台外接屏，你远程连回去办公。远程只需要一块屏，但系统
+里两块都活着，于是远程软件里得来回切屏。远程前跑一下 `monctl off`，桌面
+缩到一块屏；回到工位 `monctl all` 全部恢复。
 
 ```console
 $ monctl list
@@ -16,165 +16,131 @@ id              state     main  detail                   name
 2               active    *     1920x1080 @60Hz (0,0)    DELL P2317H
 5               active          1920x1080 @60Hz (1920,0) DELL P2314H
 
-$ monctl off          # turn off the non-main screen
+$ monctl off          # 关掉非主屏
 disabled  5 "DELL P2314H" (1920x1080 @60Hz (1920,0))
 — 1 display active now (1 changed)
 
-$ monctl all          # bring everything back
+$ monctl all          # 全部恢复
 enabled  5 "DELL P2314H" (n/a)
 — 2 displays active now (1 changed)
 ```
 
-A disabled display disappears from the OS (windows and the mouse can't reach it,
-screen sharing sees one screen). Turning it back on restores its position and
-resolution.
+被关掉的显示器会从系统里彻底消失（窗口和鼠标都过不去，远程采集端只看得到
+一块屏）。重新开启时位置、分辨率自动恢复。
 
-## Usage
+## 用法
 
 ```
-monctl list                  show all connected displays
-monctl off  [ID|main]        disable a display        (default: the non-main one)
-monctl on   [ID|main|all]    enable display(s)        (default: all that are off)
-monctl toggle [ID|main]      flip one display
-monctl solo [ID|main]        keep only one display on (default: main)
-monctl all                   enable every connected display
-monctl forget [ID|all]       drop remembered off-state entries
+monctl list                  列出所有已连接显示器
+monctl off  [ID|main]        关掉某块屏      （默认：非主屏）
+monctl on   [ID|main|all]    开启            （默认：所有关着的）
+monctl toggle [ID|main]      切换某块屏
+monctl solo [ID|main]        只保留一块屏    （默认：主屏）
+monctl all                   全部开启
+monctl forget [ID|all]       清除记住的关闭状态
 
-monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)
-monctl awake off|status      release / inspect the hold (--display also keeps the screen on)
-monctl sleep                 suspend the machine now
+monctl awake [时长]          阻止休眠（2h、90m、2h30m、3600；不带时长 = 直到解除）
+monctl awake off|status      解除 / 查看保持状态（--display 连屏幕一起常亮）
+monctl sleep                 立即休眠
 ```
 
-Display safety rails:
+显示器安全设计：
 
-- **The last active screen can never be turned off.** `off` refuses (exit 1)
-  when only one display is active — you can't blind yourself.
-- **Global recovery hotkey** (both tray apps): `Ctrl+Alt+Shift+D`
-  (`⌃⌥⇧D` on macOS) re-enables every display, blind-safe — even if the
-  remaining screen is dark, one keypress brings the others back.
-- Off-state is remembered in a small JSON file
-  (`~/Library/Application Support/monctl/state.json` on macOS,
-  `~/.config/monctl/state.json` on Linux, `%APPDATA%\monctl\state.json`
-  on Windows), because a disabled display usually vanishes from the OS
-  enumeration entirely — remembering its id is the only way back.
-- On macOS the change is session-scoped: logout/reboot clears it, so a reboot
-  never leaves you with a mysteriously dead screen. Physical fallbacks always
-  work too: replug the cable, power-cycle the monitor, or reboot.
-  (Moving the mouse only wakes *sleeping* displays — a monctl-disabled display
-  is "unplugged" by definition, which is why the hotkey exists.)
+- **最后一块活动屏永远关不掉**。只剩一块屏时 `off` 直接拒绝（退出码 1），
+  不可能把自己弄瞎。
+- 关闭状态记在一个小 JSON 文件里（macOS
+  `~/Library/Application Support/monctl/state.json`，Linux
+  `~/.config/monctl/state.json`，Windows `%APPDATA%\monctl\state.json`）。
+  因为屏幕被关后会从系统枚举里彻底消失，只有记住 id 才能找回来。
+- macOS 上是会话级状态：注销/重启自动清空，不会重启后莫名黑一块屏。
 
-## Keeping the machine awake
+## 防休眠
 
-`awake` works like the classic `caffeinate`, but fire-and-forget and
-cross-platform. `monctl awake 2h` returns immediately; a tiny detached holder
-process keeps an OS-level power assertion alive for the duration, then exits
-by itself — sleep simply becomes possible again. No lingering daemon, no
-settings mutated, survives-holder-death cleanly (the hold auto-expires if the
-holder process disappears).
+`awake` 的设计对标经典的 `caffeinate`，但是即发即忘、跨平台。`monctl awake 2h`
+立刻返回：一个极小的后台 holder 进程持有系统级电源断言，到点自动退出——之后
+休眠自然恢复。不驻留常驻服务、不改系统电源设置；holder 进程意外死掉时保持
+也会自动失效，不会出现「永远醒着」。
 
 ```console
-$ monctl awake 2h            # 2 hours, then allow sleep again
+$ monctl awake 2h            # 保持 2 小时，之后允许休眠
 awake: holding for 2h00m, sleep allowed again after that
-$ monctl awake 8h --display  # also keep the screen on
-$ monctl awake               # until released
+$ monctl awake 8h --display  # 连屏幕一起常亮
+$ monctl awake               # 一直保持，直到解除
 $ monctl awake status
 awake: holding, 1h59m left [holder pid 87571]
 $ monctl awake off
 awake: released
 ```
 
-Re-running `awake` extends/replaces the deadline. Mechanisms per platform:
-IOKit power assertions (macOS, visible in `pmset -g assertions`),
-`SetThreadExecutionState` (Windows), `systemd-inhibit` (Linux).
+重复执行 `awake` 会顺延/替换到期时间。各平台机制：IOKit 电源断言（macOS，
+`pmset -g assertions` 可见）、`SetThreadExecutionState`（Windows）、
+`systemd-inhibit`（Linux）。
 
-On macOS the hold includes `PreventSystemSleep` (the `caffeinate -s`
-behaviour): with the lid closed the machine stays awake as long as it's on AC
-power — made for lid-closed, external-monitor setups. Like every mainstream
-tool (Amphetamine included), an explicit "Sleep" from the Apple menu still
-wins; idle and lid-close sleep are what get blocked.
+macOS 上的保持同时包含 `PreventSystemSleep`（即 `caffeinate -s` 的效果）：
+合盖状态下只要接着电源就不会睡——专为合盖外接的使用方式设计。和所有主流
+工具（包括 Amphetamine）一样，苹果菜单里手动点「睡眠」仍然会睡；被挡住的是
+闲置休眠和合盖休眠。
 
-## Platform notes
+## 平台支持
 
-| Platform | Mechanism | Notes |
+| 平台 | 机制 | 说明 |
 | --- | --- | --- |
-| macOS | private `CGSConfigureDisplayEnabled` (dlsym at runtime) | same mechanism as the classic DisableMonitor; verified on Apple Silicon |
-| Windows | `ChangeDisplaySettingsExW` detach (zero-sized mode) | same approach as NirSoft MultiMonitorTool; behavior depends on the GPU driver |
-| Linux (X11) | `xrandr --output … --off/--auto` | any WM/DE |
-| Linux (KDE Wayland) | `kscreen-doctor output.<name>.disable/enable` | |
-| Linux (GNOME Wayland) | not supported yet | no stable public interface; use an X11 session |
+| macOS | 私有接口 `CGSConfigureDisplayEnabled`（运行时 dlsym） | 与老牌 DisableMonitor 同原理，Apple Silicon 实测 |
+| Windows | `ChangeDisplaySettingsExW` 分离（零尺寸模式） | 与 NirSoft MultiMonitorTool 同方案；具体行为取决于显卡驱动 |
+| Linux (X11) | `xrandr --output … --off/--auto` | 任意桌面环境 |
+| Linux (KDE Wayland) | `kscreen-doctor output.<名字>.disable/enable` | |
+| Linux (GNOME Wayland) | 暂不支持 | 没有稳定的公开接口；请用 X11 会话 |
 
-Windows specifics (verified on real hardware):
+Windows 的 id（`\\.\DISPLAY2`）和 Linux 的 id（`DP-1`）用 `monctl list` 查；
+macOS 的 id 是数字、重启后会变（反正重启后关闭状态也清空了）。
 
-- **Run it inside your desktop session.** Windows display APIs are
-  session-scoped: from a service / SSH context (session 0)
-  `EnumDisplayDevicesW` sees nothing, so remote-execution wrappers must land
-  the process in the interactive session (e.g. a scheduled task with an
-  interactive token).
-- **Some outputs refuse detaching.** GPU phantom outputs (an adapter with no
-  real panel) reject the zero-sized mode with `DISP_CHANGE_BADMODE`; monctl
-  reports it and leaves everything untouched. Real panels detach fine — this
-  is the same limitation MultiMonitorTool has.
-- Re-attach always falls back to a real registry mode, never 0x0, so a
-  restored screen can't come back dead.
+## 附加
 
-Windows ids (`\\.\DISPLAY2`) and Linux ids (`DP-1`) are shown by `monctl list`;
-macOS ids are numeric and change across reboots (the remembered off-state is
-cleared on reboot anyway).
+- **macOS 菜单栏小应用**：[`macos-tray/`](macos-tray) —— 托盘图标点开即可
+  逐屏开关，带「只留主屏」和同样的最后一块屏保护。编译：
+  `swiftc -O macos-tray/tray.swift -o ~/bin/monctl-tray`。与 CLI 共享同一份
+  状态文件。
+- **Windows 托盘**：`cargo build --release` 时会一起产出
+  `target/release/monctl-tray.exe`（win32 原生，零依赖）。双击运行：
+  **左键**一键开关副屏，**右键**菜单逐屏开关、只留主屏、保持唤醒（防休眠，
+  当前时长带勾选）和开机自启；悬停图标显示当前状态，每次操作都有气泡反馈；
+  全局热键 **Ctrl+Alt+Shift+D** 一键恢复全部显示器（屏幕全关时的盲操作
+  保命符）。注意在登录用户的会话里运行（远程场景用
+  [`extras/windows-session-run.cmd`](extras/windows-session-run.cmd) 跳进
+  控制台会话）。
 
-## Extras
+### Windows 故障排查
 
-- **macOS menu bar app**: [`macos-tray/`](macos-tray) — a tiny tray app with the
-  same toggle per display, "keep only main", "keep awake" durations, an
-  auto-start-at-login toggle, and the same last-screen guard. Build with
-  `swiftc -O macos-tray/tray.swift -o ~/bin/monctl-tray` (see
-  [macos-tray/README.md](macos-tray/README.md)). It shares the same state files
-  as the CLI.
-- **Windows tray**: built from the same repo — `cargo build --release` produces
-  `monctl-tray.exe` next to `monctl.exe` (pure win32, no dependencies). Same
-  menus, plus an autostart toggle backed by the `HKCU …\Run` registry key and a
-  global recovery hotkey **Ctrl+Alt+Shift+D** (re-enables every display — for
-  when you turned off the wrong one from a blind remote session). Like all
-  Windows display APIs it must run in the logged-on user's session.
+- **托盘图标没出现**：Win11 任务栏偶尔不渲染新注册的托盘图标（图标其实已
+  注册，右下角 `^` 溢出区里找找蓝色 M）。注销重登或重启「Windows 资源管理
+  器」（任务管理器 → 右键 Windows 资源管理器 → 重新启动）即可显示。
+- **远程/服务上下文里 `monctl list` 为空**：显示 API 是会话级的，SYSTEM
+  任务计划里跑看不到屏幕；用上面的 `windows-session-run.cmd` 跳进登录用户
+  的会话再执行。
+- **主屏无法关闭**：Windows 显卡驱动普遍允许分离主屏，但**拒绝重新挂载**
+  （NVIDIA 实测返回 DISP_CHANGE_FAILED），关掉后无法程序化找回，只能重启。
+  monctl 已在 CLI 与托盘里同时禁止关闭主屏，只关副屏即可。
+- **id 带 `\\.\` 前缀**：`monctl off DISPLAY2` 和 `monctl off \\.\DISPLAY2`
+  都可以，`monctl list` 的输出可直接抄。
 
-### Windows troubleshooting
+## 构建
 
-- **Tray icon doesn't show up**: Win11 sometimes skips rendering newly
-  registered tray icons (the icon IS registered — check the `^` overflow area
-  for the blue M). Signing out/in or restarting "Windows Explorer" in Task
-  Manager makes it appear.
-- **Empty `monctl list` over SSH / from a service**: display APIs are
-  session-scoped on Windows. Hop into the console session with
-  [`extras/windows-session-run.cmd`](extras/windows-session-run.cmd).
-- **The primary display cannot be turned off**: Windows drivers generally
-  accept detaching the primary display but refuse the re-attach
-  (DISP_CHANGE_FAILED on NVIDIA), leaving it dark until reboot. monctl refuses
-  it in both the CLI and the tray; close a secondary display instead.
-- **Display ids**: both `monctl off DISPLAY2` and `monctl off \\.\DISPLAY2`
-  work; copy straight from `monctl list` output.
-- **Running monctl on a headless Windows box over remote exec** (winforge,
-  SSH-as-SYSTEM, …): the service context cannot see displays, so hop into the
-  console session with a one-shot scheduled task — template in
-  [`extras/windows-session-run.cmd`](extras/windows-session-run.cmd).
-
-## Build
-
-Any of the three platforms, with a Rust toolchain:
+任一平台，装好 Rust 工具链即可：
 
 ```sh
 cargo build --release
 # → target/release/monctl
 ```
 
-Or grab a prebuilt binary from [Releases](../../releases) (macOS arm64/x86_64,
-Windows x86_64, Linux x86_64) — built by GitHub Actions on each tag.
+或到 [Releases](../../releases) 下载对应平台二进制（macOS arm64/x86_64、
+Windows x86_64、Linux x86_64），由 GitHub Actions 在打 tag 时自动构建。
 
-## Why
+## 为什么写这个
 
-The existing tools for this were either unmaintained (DisableMonitor, last
-touched in 2018), paywalled per-feature (BetterDisplay), or GUI-only. This is
-the 200-line core of the idea as a plain CLI that also runs on Windows and
-Linux.
+现成工具要么年久失修（DisableMonitor，2018 年后停更），要么核心功能收费
+（BetterDisplay），要么只有图形界面。这里把需求的 200 行内核做成纯 CLI，
+顺便补上 Windows 和 Linux。
 
-## License
+## 许可
 
-MIT — see [LICENSE](LICENSE).
+MIT —— 见 [LICENSE](LICENSE)。
