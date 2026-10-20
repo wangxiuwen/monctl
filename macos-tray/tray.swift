@@ -274,7 +274,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let remembered = loadState()
         let cgIDs = Set(displays.map(\.id))
-        for (id, name) in remembered.sorted(by: { $0.key < $1.key }) where !cgIDs.contains(id) {
+        let activeNames = Set(displays.filter(\.active).map(\.name))
+        for (id, name) in remembered.sorted(by: { $0.key < $1.key })
+        where !cgIDs.contains(id) && !activeNames.contains(name) {
+            // macOS display ids shift across reboots/reconnects; a remembered
+            // entry whose name matches a display that's active right now is
+            // the same panel under a new id, not a second screen. The state
+            // entry stays so 全部开启 ⌃⌥⇧D still tries it.
             addItem("开启  \(name)", action: #selector(toggleItem(_:)), target: self, enabled: true, id: id)
         }
         menu.addItem(.separator())

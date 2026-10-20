@@ -135,10 +135,10 @@ cleared on reboot anyway).
   [macos-tray/README.md](macos-tray/README.md)). It shares the same state files
   as the CLI.
 - **Windows tray**: built from the same repo — `cargo build --release` produces
-  `monctl-tray.exe` next to `monctl.exe` (pure win32, no dependencies). Run it
-  and **left-click** flips the secondary display; **right-click** opens the
-  menu (per-display toggles, keep-only-main, keep-awake with a tick on the
-  active duration, the one-click "keep screen on" toggle, autostart). The
+  `monctl-tray.exe` next to `monctl.exe` (pure win32, no dependencies). Any
+  click opens the menu (per-display toggles, keep-only-main, keep-awake with a
+  tick on the active duration, the one-click "keep screen on" toggle,
+  autostart). The
   tooltip shows live state and every action reports via a balloon. Global
   recovery hotkey **Ctrl+Alt+Shift+D**
   (re-enables every display — for when you turned off the wrong one from a

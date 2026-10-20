@@ -472,54 +472,13 @@ mod tray {
         if let Some((r, _, display_hold)) = awake_state() {
             tip.push_str(&format!(" · 防休眠 {}{}", fmt_secs(r), if display_hold { "，屏幕常亮" } else { "" }));
         }
-        tip.push_str("（左键开关副屏，右键菜单）");
+        tip.push_str("（点击打开菜单）");
         let mut n = NOTIFYICONDATAW::new(hwnd);
         n.uflags = NIF_TIP; // tip only — never the icon lane (see notify)
         let t = wide(&tip);
         let tl = t.len().min(127);
         n.tip[..tl].copy_from_slice(&t[..tl]);
         Shell_NotifyIconW(NIM_MODIFY, &mut n);
-    }
-
-    /// Left-click action: flip the secondary display. If one is on, close it;
-    /// otherwise bring back every remembered/off display. The one command
-    /// remote workers actually need, one click away.
-    unsafe fn toggle_secondary(hwnd: HWND) {
-        let displays = monctl::windows::list();
-        let active_count = displays.iter().filter(|d| d.active).count();
-        let secondary = displays.iter().find(|d| d.active && !d.main).cloned();
-        match secondary {
-            Some(d) if active_count > 1 => {
-                match monctl::windows::set_enabled(&d.id, false) {
-                    Ok(()) => {
-                        let mut st = common::load_state();
-                        st.insert(d.id.clone(), d.name.clone());
-                        common::save_state(&st);
-                        notify(hwnd, "monctl", &format!("已关闭 {}", d.name));
-                    }
-                    Err(e) => {
-                        let log = common::state_path().with_file_name("tray-error.log");
-                        let _ = std::fs::write(log, format!("{e}\n"));
-                        notify(hwnd, &format!("关闭 {} 失败", d.name), &e);
-                    }
-                }
-            }
-            _ => {
-                let state = common::load_state();
-                let mut restored = 0usize;
-                for id in state.keys() {
-                    if monctl::windows::set_enabled(id, true).is_ok() {
-                        let mut st = common::load_state();
-                        st.remove(id);
-                        common::save_state(&st);
-                        restored += 1;
-                    }
-                }
-                let msg = if restored > 0 { format!("已开启 {restored} 块屏") } else { "没有副屏可操作".to_string() };
-                notify(hwnd, "monctl", &msg);
-            }
-        }
-        refresh_tooltip(hwnd);
     }
 
     unsafe fn build_menu(displays: &[DisplayInfo], remember: &OffState) -> (HMENU, bool) {
@@ -556,8 +515,13 @@ mod tray {
             AppendMenuW(menu, flags, (ID_DISPLAY_BASE + i as u32) as WPARAM, wide(&title).as_ptr());
         }
         let seen = |id: &str| displays.iter().any(|d| d.id == id);
+        let active_names: Vec<&str> = displays.iter().filter(|d| d.active).map(|d| d.name.as_str()).collect();
         for (i, (id, name)) in remember.iter().enumerate() {
-            if !seen(id) {
+            // A remembered id that's gone from the OS while an ACTIVE display
+            // carries the same name is the same panel under a new id (ids
+            // shift across reboots/hardware changes) — not a second screen.
+            // Keep the state entry so 全部开启 can still try it.
+            if !seen(id) && !active_names.contains(&name.as_str()) {
                 AppendMenuW(menu, MF_STRING, (REMEMBER_BASE + i as u32) as WPARAM, wide(&format!("开启  {name}")).as_ptr());
             }
         }
@@ -799,15 +763,7 @@ mod tray {
         }
         if msg == WM_USER_TRAY {
             let up = lp as DWORD as UINT;
-            if up == WM_LBUTTONUP {
-                // left = the everyday command: flip the secondary display
-                let hwnd_addr = hwnd as usize;
-                std::thread::spawn(move || unsafe {
-                    toggle_secondary(hwnd_addr as HWND);
-                });
-                return 0;
-            }
-            if up == WM_RBUTTONUP {
+            if up == WM_LBUTTONUP || up == WM_RBUTTONUP {
                 UI.with(|u| {
                     let mut ui = u.borrow_mut();
                     ui.snapshot = monctl::windows::list();
@@ -969,7 +925,7 @@ mod tray {
             let title = wide("monctl 托盘已启动");
             let t = title.len().min(63);
             b.info_title[..t].copy_from_slice(&title[..t]);
-            let body = wide("左键开关副屏；右键管理屏幕和防休眠；Ctrl+Alt+Shift+D 恢复全部显示器。");
+            let body = wide("点击图标打开菜单，管理屏幕和防休眠；Ctrl+Alt+Shift+D 恢复全部显示器。");
             let bl = body.len().min(255);
             b.info[..bl].copy_from_slice(&body[..bl]);
             Shell_NotifyIconW(NIM_MODIFY, &mut b);

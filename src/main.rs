@@ -127,8 +127,11 @@ fn print_list(displays: &[DisplayInfo]) {
     }
     let state = common::load_state();
     let seen: BTreeSet<&String> = displays.iter().map(|d| &d.id).collect();
+    let active_names: BTreeSet<&str> = displays.iter().filter(|d| d.active).map(|d| d.name.as_str()).collect();
     for (id, name) in &state {
-        if !seen.contains(id) {
+        // a remembered id gone from the OS while an active display has the
+        // same name = the same panel under a new id, not a third screen
+        if !seen.contains(id) && !active_names.contains(name.as_str()) {
             println!("{} {} {} {} {}", pad(id, 15), pad("off*", 9), pad("", 5), pad("-", 24), name);
         }
     }
