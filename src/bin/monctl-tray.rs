@@ -88,6 +88,7 @@ mod tray {
     const ID_AWAKE_BASE: u32 = 302; // +0..=3 durations, 4 = off
     const ID_AUTOSTART: u32 = 307;
     const ID_QUIT: u32 = 308;
+    const ID_KEEP_DISPLAY: u32 = 309; // one-click screen-sleep prevention toggle
     const AWAKE_SECS: [(&str, u64); 4] = [("1 小时", 3600), ("4 小时", 14400), ("8 小时", 28800), ("不限时", 0)];
 
     #[repr(C)]
@@ -413,8 +414,8 @@ mod tray {
         }
     }
 
-    /// (remaining_secs, requested_secs) of a live awake hold.
-    fn awake_state() -> Option<(u64, u64)> {
+    /// (remaining_secs, requested_secs, screen kept on) of a live awake hold.
+    fn awake_state() -> Option<(u64, u64, bool)> {
         let p = common::awake_path();
         let s = std::fs::read_to_string(p).ok()?;
         let get = |k: &str| -> Option<u64> {
@@ -435,7 +436,7 @@ mod tray {
         if now.saturating_sub(heartbeat) > 15 {
             return None;
         }
-        Some((get("deadline")?.saturating_sub(now), get("requested").unwrap_or(0)))
+        Some((get("deadline")?.saturating_sub(now), get("requested").unwrap_or(0), get("display") == Some(1)))
     }
 
     fn fmt_secs(s: u64) -> String {
@@ -468,8 +469,8 @@ mod tray {
         let active = displays.iter().filter(|d| d.active).count();
         let secondary_on = displays.iter().any(|d| d.active && !d.main);
         let mut tip = format!("monctl · {active} 块屏 · 副屏{}", if secondary_on { "开" } else { "关" });
-        if let Some((r, _)) = awake_state() {
-            tip.push_str(&format!(" · 防休眠 {}", fmt_secs(r)));
+        if let Some((r, _, display_hold)) = awake_state() {
+            tip.push_str(&format!(" · 防休眠 {}{}", fmt_secs(r), if display_hold { "，屏幕常亮" } else { "" }));
         }
         tip.push_str("（左键开关副屏，右键菜单）");
         let mut n = NOTIFYICONDATAW::new(hwnd);
@@ -571,15 +572,23 @@ mod tray {
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
 
         let awake = awake_state();
+        let display_hold = awake.map(|(_, _, d)| d).unwrap_or(false);
+        let kd_flags = MF_STRING | if display_hold { MF_CHECKED } else { 0 };
+        AppendMenuW(menu, kd_flags, ID_KEEP_DISPLAY as WPARAM, wide("屏幕常亮").as_ptr());
         let awake_label = match awake {
-            Some((r, _)) => format!("保持唤醒（剩余 {}）", fmt_secs(r)),
+            Some((r, _, _)) if r > 5 * 365 * 24 * 3600 => {
+                format!("保持唤醒（不限时{}）", if display_hold { "，屏幕常亮" } else { "" })
+            }
+            Some((r, _, _)) => {
+                format!("保持唤醒（剩余 {}{}）", fmt_secs(r), if display_hold { "，屏幕常亮" } else { "" })
+            }
             None => "保持唤醒".to_string(),
         };
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_AWAKE_BASE as WPARAM, wide(&awake_label).as_ptr());
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wide(&awake_label).as_ptr());
         for (i, (label, secs)) in AWAKE_SECS.iter().enumerate() {
             // tick the duration currently on hold (互斥单选)
             let checked = match awake {
-                Some((_, requested)) => requested == *secs,
+                Some((_, requested, _)) => requested == *secs,
                 None => false,
             };
             let flags = MF_STRING | if checked { MF_CHECKED } else { 0 };
@@ -697,8 +706,7 @@ mod tray {
                     }
                 });
             }
-            ID_AWAKE_BASE => {}
-            i if i >= ID_AWAKE_BASE + 10 && i <= ID_AWAKE_BASE + 13 => {
+            i if (ID_AWAKE_BASE + 10..=ID_AWAKE_BASE + 13).contains(&i) => {
                 let secs = AWAKE_SECS[(i - ID_AWAKE_BASE - 10) as usize].1;
                 if secs == 0 {
                     spawn_monctl(&["awake"]);
@@ -721,6 +729,23 @@ mod tray {
                 spawn_monctl(&["awake", "off"]);
                 unsafe {
                     notify(hwnd, "保持唤醒", "已解除");
+                }
+                let hwnd_addr = hwnd as usize;
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    unsafe { refresh_tooltip(hwnd_addr as HWND) };
+                });
+            }
+            ID_KEEP_DISPLAY => {
+                // one-click screen-sleep prevention: unlimited hold with --display
+                let turning_off = awake_state().map(|(_, _, d)| d).unwrap_or(false);
+                if turning_off {
+                    spawn_monctl(&["awake", "off"]);
+                } else {
+                    spawn_monctl(&["awake", "--display"]);
+                }
+                unsafe {
+                    notify(hwnd, "屏幕常亮", if turning_off { "已关闭，屏幕可正常休眠" } else { "已开启：屏幕不再休眠，直到再次点击" });
                 }
                 let hwnd_addr = hwnd as usize;
                 std::thread::spawn(move || {

@@ -85,8 +85,10 @@ $ monctl awake off
 awake: released
 ```
 
-Re-running `awake` extends/replaces the deadline. Mechanisms per platform:
-IOKit power assertions (macOS, visible in `pmset -g assertions`),
+Re-running `awake` extends/replaces the deadline. Both tray apps also have a
+one-click **keep screen on** toggle (屏幕常亮): an unlimited hold with
+`--display`, so the screen cannot sleep until you click it again. Mechanisms
+per platform: IOKit power assertions (macOS, visible in `pmset -g assertions`),
 `SetThreadExecutionState` (Windows), `systemd-inhibit` (Linux).
 
 On macOS the hold includes `PreventSystemSleep` (the `caffeinate -s`
@@ -126,8 +128,9 @@ cleared on reboot anyway).
 ## Extras
 
 - **macOS menu bar app**: [`macos-tray/`](macos-tray) — a tiny tray app with the
-  same toggle per display, "keep only main", "keep awake" durations, an
-  auto-start-at-login toggle, and the same last-screen guard. Build with
+  same toggle per display, "keep only main", "keep awake" durations, a one-click
+  "keep screen on" toggle, an auto-start-at-login toggle, and the same
+  last-screen guard. Build with
   `swiftc -O macos-tray/tray.swift -o ~/bin/monctl-tray` (see
   [macos-tray/README.md](macos-tray/README.md)). It shares the same state files
   as the CLI.
@@ -135,8 +138,9 @@ cleared on reboot anyway).
   `monctl-tray.exe` next to `monctl.exe` (pure win32, no dependencies). Run it
   and **left-click** flips the secondary display; **right-click** opens the
   menu (per-display toggles, keep-only-main, keep-awake with a tick on the
-  active duration, autostart). The tooltip shows live state and every action
-  reports via a balloon. Global recovery hotkey **Ctrl+Alt+Shift+D**
+  active duration, the one-click "keep screen on" toggle, autostart). The
+  tooltip shows live state and every action reports via a balloon. Global
+  recovery hotkey **Ctrl+Alt+Shift+D**
   (re-enables every display — for when you turned off the wrong one from a
   blind remote session). Like all Windows display APIs it must run in the
   logged-on user's session.

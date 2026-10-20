@@ -72,7 +72,9 @@ $ monctl awake off
 awake: released
 ```
 
-重复执行 `awake` 会顺延/替换到期时间。各平台机制：IOKit 电源断言（macOS，
+重复执行 `awake` 会顺延/替换到期时间。两个托盘（macOS 菜单栏 / Windows
+任务栏）还有一键「**屏幕常亮**」开关：等价于不限时 + `--display`，点一下
+屏幕不再休眠，再点一下恢复。各平台机制：IOKit 电源断言（macOS，
 `pmset -g assertions` 可见）、`SetThreadExecutionState`（Windows）、
 `systemd-inhibit`（Linux）。
 
@@ -97,7 +99,8 @@ macOS 的 id 是数字、重启后会变（反正重启后关闭状态也清空�
 ## 附加
 
 - **macOS 菜单栏小应用**：[`macos-tray/`](macos-tray) —— 托盘图标点开即可
-  逐屏开关，带「只留主屏」和同样的最后一块屏保护。编译：
+  逐屏开关，带「只留主屏」、一键「屏幕常亮」（阻止屏幕休眠）和同样的
+  最后一块屏保护。编译：
   `swiftc -O macos-tray/tray.swift -o ~/bin/monctl-tray`。与 CLI 共享同一份
   状态文件。
 - **Windows 托盘**：`cargo build --release` 时会一起产出

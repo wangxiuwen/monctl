@@ -174,21 +174,22 @@ private func runMonctlAwake(_ args: [String]) {
     try? p.run()
 }
 
-/// nil when nothing is holding; otherwise remaining seconds.
-private func awakeRemaining() -> Double? {
+/// nil when nothing is holding; otherwise remaining seconds and whether the
+/// screen is kept on (the hold's --display flag).
+private func awakeState() -> (remaining: Double?, display: Bool) {
     let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("monctl/awake.json")
-    guard let s = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+    guard let s = try? String(contentsOf: url, encoding: .utf8) else { return (nil, false) }
     func num(_ key: String) -> Double? {
         guard let r = s.range(of: "\"\(key)\":") else { return nil }
         let digits = s[r.upperBound...].prefix { $0.isNumber }
         return Double(digits)
     }
-    guard let deadline = num("deadline"), let heartbeat = num("heartbeat") else { return nil }
-    if num("release") == 1 { return nil }
+    guard let deadline = num("deadline"), let heartbeat = num("heartbeat") else { return (nil, false) }
+    if num("release") == 1 { return (nil, false) }
     let now = Date().timeIntervalSince1970
-    if now - heartbeat > 15 { return nil } // stale holder (crash/reboot)
-    return max(0, deadline - now)
+    if now - heartbeat > 15 { return (nil, false) } // stale holder (crash/reboot)
+    return (max(0, deadline - now), num("display") == 1)
 }
 
 private func fmtRemaining(_ secs: Double) -> String {
@@ -281,10 +282,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addItem("全部开启 ⌃⌥⇧D", action: #selector(allOn), target: self, enabled: activeCount < displays.count || !remembered.isEmpty)
         menu.addItem(.separator())
         if let monctl = monctlPath() {
-            let remaining = awakeRemaining()
-            let awakeTitle = remaining != nil
-                ? "保持唤醒（剩余 \(fmtRemaining(remaining!))）"
-                : "保持唤醒"
+            let (remaining, displayHold) = awakeState()
+            let keep = NSMenuItem(title: "屏幕常亮", action: #selector(toggleKeepDisplay(_:)), keyEquivalent: "")
+            keep.target = self
+            keep.state = displayHold ? .on : .off
+            menu.addItem(keep)
+            let awakeTitle: String
+            if let r = remaining {
+                awakeTitle = r > 5 * 365 * 24 * 3600
+                    ? "保持唤醒（不限时\(displayHold ? "，屏幕常亮" : "")）"
+                    : "保持唤醒（剩余 \(fmtRemaining(r))\(displayHold ? "，屏幕常亮" : "")）"
+            } else {
+                awakeTitle = "保持唤醒"
+            }
             let awakeItem = NSMenuItem(title: awakeTitle, action: nil, keyEquivalent: "")
             let sub = NSMenu()
             for (label, secs) in [("1 小时", "3600"), ("4 小时", "14400"), ("8 小时", "28800"), ("不限时", "")] {
@@ -375,6 +385,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func awakeFor(_ sender: NSMenuItem) {
         guard let arg = (sender.representedObject as? String) else { return }
         runMonctlAwake(arg == "" ? [] : [arg])
+        statusItem.menu?.cancelTracking()
+        rebuildMenu()
+    }
+
+    /// One-click "keep the screen on": an unlimited awake hold with --display,
+    /// released the same way. Shares the single hold with 保持唤醒.
+    @objc private func toggleKeepDisplay(_ sender: NSMenuItem) {
+        let (_, displayHold) = awakeState()
+        runMonctlAwake(displayHold ? ["off"] : ["--display"])
         statusItem.menu?.cancelTracking()
         rebuildMenu()
     }
