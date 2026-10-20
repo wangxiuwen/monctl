@@ -447,7 +447,10 @@ mod tray {
     /// silent background threads are how "点了没反应" happens.
     unsafe fn notify(hwnd: HWND, title: &str, body: &str) {
         let mut n = NOTIFYICONDATAW::new(hwnd);
-        n.uflags |= NIF_INFO;
+        // Only claim the balloon fields: NIM_MODIFY honors uFlags, and letting
+        // NIF_ICON through with a NULL hIcon WIPES the tray image (the
+        // "icon shows up then vanishes" bug).
+        n.uflags = NIF_INFO;
         n.info_flags = 0x1; // NIIF_INFO
         let t = wide(title);
         let tl = t.len().min(63);
@@ -470,7 +473,7 @@ mod tray {
         }
         tip.push_str("（左键开关副屏，右键菜单）");
         let mut n = NOTIFYICONDATAW::new(hwnd);
-        n.uflags |= NIF_TIP;
+        n.uflags = NIF_TIP; // tip only — never the icon lane (see notify)
         let t = wide(&tip);
         let tl = t.len().min(127);
         n.tip[..tl].copy_from_slice(&t[..tl]);
@@ -936,7 +939,7 @@ mod tray {
             SetTimer(hwnd, REFRESH_TIMER_ID, 12_000, std::ptr::null_mut());
             // one-shot balloon so people can locate the icon (often hidden in the ^ overflow)
             let mut b = NOTIFYICONDATAW::new(hwnd);
-            b.uflags |= NIF_INFO;
+            b.uflags = NIF_INFO; // balloon only — never the icon lane
             b.info_flags = 0x1; // NIIF_INFO
             let title = wide("monctl 托盘已启动");
             let t = title.len().min(63);
