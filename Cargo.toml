@@ -1,8 +1,8 @@
 [package]
 name = "monctl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Turn individual displays on/off from the command line — as if the cable were pulled (macOS / Windows / Linux)"
+description = "The screen assistant: displays on/off, resolutions & HiDPI, mirroring, virtual displays, tablets as extra screens (macOS / Windows / Linux)"
 license = "MIT"
 repository = "https://github.com/wangxiuwen/monctl"
 keywords = ["display", "monitor", "cli", "multi-monitor"]

@@ -1,51 +1,77 @@
 name: Release
 
+# Tag vX.Y.Z → installers + archives on the GitHub release.
+# workflow_dispatch builds the same artifacts without publishing.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
+  macos:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Package (unix)
-        if: runner.os != 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../monctl-${{ matrix.target }}.tar.gz monctl
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/monctl.exe -DestinationPath monctl-${{ matrix.target }}.zip
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: monctl.app + dmg (universal)
+        run: packaging/macos/build-app.sh dist
       - uses: actions/upload-artifact@v4
         with:
-          name: monctl-${{ matrix.target }}
-          path: monctl-${{ matrix.target }}.*
+          name: macos
+          path: |
+            dist/monctl-macos.dmg
+            dist/monctl-macos-universal.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Installer + zip
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force dist | Out-Null
+          & $iscc "/DVersion=$version" packaging\windows\monctl.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path target\release\monctl.exe, target\release\monctl-tray.exe -DestinationPath dist\monctl-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/monctl-setup.exe
+            dist/monctl-windows-x64.zip
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: |
+          cargo build --release
+          mkdir -p dist
+          tar -C target/release -czf dist/monctl-linux-x64.tar.gz monctl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/monctl-linux-x64.tar.gz
+          if-no-files-found: error
 
   release:
-    needs: build
+    needs: [macos, windows, linux]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

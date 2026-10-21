@@ -2,34 +2,51 @@
 
 English · [简体中文](README.zh-CN.md)
 
-Turn individual displays on/off from the command line — as if the cable were pulled.
+The screen assistant, as one small dependency-free binary (plus a menu bar /
+tray app). macOS / Windows / Linux.
 
-macOS / Windows / Linux. Single static binary, zero dependencies.
-
-Use case: your Mac/PC sits on a desk with two external screens, and you remote into
-it. Screen sharing only needs one screen, but the OS keeps both active — so you
-end up switching monitors in the remote session. `monctl off` collapses the
-desktop to a single screen before you connect; `monctl all` brings everything
-back when you're at the desk.
+- **Turn individual displays on/off** — as if the cable were pulled.
+- **Resolutions**, including the HiDPI modes System Settings hides, **main
+  display** and **mirroring** from one command.
+- **HiDPI on any monitor** (macOS) — crisp text on screens macOS won't treat
+  as Retina.
+- **Virtual displays** (macOS) — any size, HiDPI, for headless Macs and
+  screen sharing.
+- **Any tablet as an extra screen** (macOS → iPad / Android / Windows
+  tablets) — over Wi-Fi or USB, nothing to install on the tablet.
+- **Keep awake** / sleep now.
 
 ```console
 $ monctl list
-id              state     main  detail                   name
-2               active    *     1920x1080 @60Hz (0,0)    DELL P2317H
-5               active          1920x1080 @60Hz (1920,0) DELL P2314H
+id              state     main  detail                         name
+2               active    *     1920x1080 @60Hz (0,0)          DELL P2317H
+5               active          1920x1080 @60Hz (1920,0)       DELL P2314H
 
 $ monctl off          # turn off the non-main screen
 disabled  5 "DELL P2314H" (1920x1080 @60Hz (1920,0))
-— 1 display active now (1 changed)
+- 1 display active now (1 changed)
 
 $ monctl all          # bring everything back
 enabled  5 "DELL P2314H" (n/a)
-— 2 displays active now (1 changed)
+- 2 displays active now (1 changed)
 ```
 
 A disabled display disappears from the OS (windows and the mouse can't reach it,
 screen sharing sees one screen). Turning it back on restores its position and
-resolution.
+resolution. Typical use: you remote into a desk machine with two screens —
+`monctl off` before connecting, `monctl all` when you're back.
+
+## Install
+
+From [Releases](../../releases/latest):
+
+| | |
+| --- | --- |
+| macOS | `monctl-macos.dmg` — drag **monctl.app** to Applications. It lives in the menu bar; the CLI is inside: `ln -s /Applications/monctl.app/Contents/MacOS/monctl /usr/local/bin/monctl`. Not notarized: the first launch needs right-click → Open (or System Settings → Privacy & Security → Open Anyway). |
+| Windows | `monctl-setup.exe` — per-user install, no admin; options for sign-in autostart and adding `monctl` to PATH. Or `monctl-windows-x64.zip` (portable). |
+| Linux | `monctl-linux-x64.tar.gz` |
+
+Or `cargo build --release` (see [Build](#build)).
 
 ## Usage
 
@@ -42,10 +59,20 @@ monctl solo [ID|main]        keep only one display on (default: main)
 monctl all                   enable every connected display
 monctl forget [ID|all]       drop remembered off-state entries
 
+monctl mode [ID] [WxH[@Hz]|N]  list / switch resolutions (HiDPI included; --lodpi for 1x)
+monctl main ID               make a display the main one (menu bar, Dock / taskbar)
+monctl mirror ID [SOURCE]    show SOURCE (default: main) on display ID; `mirror off` undoes
+monctl hidpi [ID] | off [ID] macOS: crisp HiDPI rendering on any monitor
+monctl virtual [add [WxH[@Hz]] [--name N] [--no-hidpi] | rm ID|all]   macOS
+monctl cast [--port N] [--display ID|main] [--bitrate MBPS]          macOS
+
 monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)
 monctl awake off|status      release / inspect the hold (--display also keeps the screen on)
 monctl sleep                 suspend the machine now
 ```
+
+IDs come from `monctl list`; short forms work (`DISPLAY2` or `2` for
+`\\.\DISPLAY2`).
 
 Display safety rails:
 
@@ -64,6 +91,88 @@ Display safety rails:
   work too: replug the cable, power-cycle the monitor, or reboot.
   (Moving the mouse only wakes *sleeping* displays — a monctl-disabled display
   is "unplugged" by definition, which is why the hotkey exists.)
+
+## Resolutions, main display, mirroring
+
+```console
+$ monctl mode 2              # list; * marks the current one
+*   14  2560x1440 @60Hz  HiDPI (5120x2880)
+    15  2560x1440 @60Hz
+    22  1920x1080 @60Hz  HiDPI (3840x2160)
+    ...
+$ monctl mode 2 1920x1080    # HiDPI preferred when both exist; --lodpi for 1x
+$ monctl mode 2 22           # or by number from the list
+$ monctl main 5              # menu bar / Dock (taskbar) move to display 5
+$ monctl mirror 5            # display 5 shows the main display
+$ monctl mirror off
+```
+
+On macOS the list includes the HiDPI ("looks like") modes System Settings only
+shows behind "Show all resolutions". Windows: modes and primary display via
+`ChangeDisplaySettingsEx` (mirroring: use Win+P). Linux: xrandr / kscreen-doctor.
+
+## HiDPI on any monitor (macOS)
+
+macOS renders text crisply only on screens it considers Retina. `monctl hidpi`
+fixes that for any monitor: it creates a virtual HiDPI canvas the size of the
+screen (rendered at 2x) and lets the real screen mirror it, downsampled — the
+trick BetterDisplay is known for.
+
+```console
+$ monctl hidpi 5
+hidpi on  5 "DELL P2314H" (1920x1080 @60Hz (1920,0)) - now rendered at 3840x2160 (undo: monctl hidpi off 5)
+$ monctl hidpi off 5
+```
+
+Safe by construction: the canvas lives in a small holder process; undoing it,
+a crash, logout or reboot all return the screen to normal.
+
+## Virtual displays (macOS)
+
+```console
+$ monctl virtual add 2560x1440          # also 1080p, 4k, 3840x2160@30, --no-hidpi, --name
+added   8 "monctl Virtual 1" (2560x1440 @60Hz, HiDPI)
+$ monctl virtual                        # list
+$ monctl virtual rm 8                   # or: rm all
+```
+
+A virtual display is a real screen to macOS: drag windows onto it, share it,
+record it, set its resolution with `monctl mode`. Useful on headless Macs
+(remote desktop at any resolution) and as a private screen during screen
+sharing. Each one is owned by a tiny holder process; it disappears with it.
+
+## Tablets as extra screens (macOS)
+
+```console
+$ monctl cast
+monctl cast - open on the tablet (same Wi-Fi):
+  http://192.168.1.20:8484/
+  ▀▀▀ (QR code) ▀▀▀
+USB  Android R58N...: wired via adb, opened http://localhost:8484/ on the tablet
+```
+
+Scan the QR code (or open the URL) on an iPad, Android or Windows tablet: a
+screen shaped exactly like the tablet appears on the Mac, and the tablet shows
+it. Nothing to install on the tablet — it's a web page.
+
+- **Touch works**: tap = click, drag = drag, long press = right click, two
+  fingers = scroll, ⌨ button = on-screen keyboard. (Needs Accessibility
+  permission for the terminal / monctl.app; showing the screen needs Screen
+  Recording permission.)
+- **Wired**: plug an Android tablet in with USB debugging on — `monctl cast`
+  sets up `adb reverse` and opens the page by itself. Over USB the page runs
+  on `localhost`, which unlocks the lowest-latency decoder (WebCodecs); over
+  Wi-Fi it uses Media Source Extensions.
+- **Several tablets** at once, each with its own screen. Rotate the tablet and
+  its screen follows.
+- `--display main` shows an existing screen instead (presenting, a second
+  view of the desk).
+- Under the hood: CGDisplayStream (frames only when something changes) →
+  VideoToolbox H.264 in low-latency mode → WebSocket. One worker process per
+  tablet: when the tablet leaves, its screen goes with it.
+
+In the menu bar app it's one click (**投屏到平板**), with the QR code in a
+window and the number of connected tablets in the menu.
 
 ## Keeping the machine awake
 
@@ -121,19 +230,30 @@ Windows specifics (verified on real hardware):
 - Re-attach always falls back to a real registry mode, never 0x0, so a
   restored screen can't come back dead.
 
+Feature support:
+
+| | macOS | Windows | Linux |
+| --- | --- | --- | --- |
+| on / off / solo | ✓ | ✓ (not the primary) | ✓ X11, KDE Wayland |
+| mode / main | ✓ (incl. HiDPI modes) | ✓ | ✓ |
+| mirror | ✓ | Win+P | ✓ X11 |
+| hidpi, virtual, cast | ✓ | – (needs a virtual display driver) | – |
+| awake / sleep | ✓ | ✓ | ✓ |
+| tray app | ✓ | ✓ | – |
+
 Windows ids (`\\.\DISPLAY2`) and Linux ids (`DP-1`) are shown by `monctl list`;
 macOS ids are numeric and change across reboots (the remembered off-state is
 cleared on reboot anyway).
 
 ## Extras
 
-- **macOS menu bar app**: [`macos-tray/`](macos-tray) — a tiny tray app with the
-  same toggle per display, "keep only main", "keep awake" durations, a one-click
-  "keep screen on" toggle, an auto-start-at-login toggle, and the same
-  last-screen guard. Build with
-  `swiftc -O macos-tray/tray.swift -o ~/bin/monctl-tray` (see
-  [macos-tray/README.md](macos-tray/README.md)). It shares the same state files
-  as the CLI.
+- **macOS menu bar app** (monctl.app in the dmg; source in
+  [`macos-tray/`](macos-tray)): per-display on/off, keep only main,
+  resolutions (with HiDPI modes), HiDPI per monitor, virtual displays,
+  one-click casting to tablets with a QR code, keep awake / keep screen on,
+  start at login, and the same last-screen guard. It drives the bundled CLI
+  and shares its state files. `packaging/macos/build-app.sh` builds the app
+  and dmg.
 - **Windows tray**: built from the same repo — `cargo build --release` produces
   `monctl-tray.exe` next to `monctl.exe` (pure win32, no dependencies). Any
   click opens the menu (per-display toggles, keep-only-main, keep-awake with a
@@ -174,15 +294,17 @@ cargo build --release
 # → target/release/monctl
 ```
 
-Or grab a prebuilt binary from [Releases](../../releases) (macOS arm64/x86_64,
-Windows x86_64, Linux x86_64) — built by GitHub Actions on each tag.
+Installers: `packaging/macos/build-app.sh` (monctl.app + dmg, universal when
+both Rust targets are installed) and `packaging/windows/monctl.iss` (Inno
+Setup). GitHub Actions builds all of them for every `v*` tag.
 
 ## Why
 
-The existing tools for this were either unmaintained (DisableMonitor, last
-touched in 2018), paywalled per-feature (BetterDisplay), or GUI-only. This is
-the 200-line core of the idea as a plain CLI that also runs on Windows and
-Linux.
+The existing tools were unmaintained (DisableMonitor, last touched in 2018),
+paywalled per feature (BetterDisplay; Duet/Sidecar-style apps for tablets), or
+GUI-only. monctl does the useful core of all of them as one small,
+dependency-free, scriptable binary — with a menu bar app on top — that also
+runs on Windows and Linux.
 
 ## License
 
