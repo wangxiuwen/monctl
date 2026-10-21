@@ -453,13 +453,20 @@ pub fn sleep_now() -> ! {
     // API directly.
     #[cfg(windows)]
     {
-        #[link(name = "powrprof")]
+        // loaded at runtime: the mingw toolchain ships no powrprof import lib
         extern "system" {
-            fn SetSuspendState(hibernate: u8, force: u8, wakeup_events_disabled: u8) -> u8;
+            fn LoadLibraryW(name: *const u16) -> *mut std::ffi::c_void;
+            fn GetProcAddress(module: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
         }
+        let dll: Vec<u16> = "powrprof.dll\0".encode_utf16().collect();
+        let f = unsafe { GetProcAddress(LoadLibraryW(dll.as_ptr()), c"SetSuspendState".as_ptr().cast()) };
+        if f.is_null() {
+            crate::common::fail("SetSuspendState is not available");
+        }
+        let set_suspend: extern "system" fn(u8, u8, u8) -> u8 = unsafe { std::mem::transmute(f) };
         println!("sleep: suspending now");
         // returns after resume (non-zero) or immediately on failure (zero)
-        if unsafe { SetSuspendState(0, 0, 0) } == 0 {
+        if set_suspend(0, 0, 0) == 0 {
             crate::common::fail(&format!("suspend request failed: {}", std::io::Error::last_os_error()));
         }
         std::process::exit(0)

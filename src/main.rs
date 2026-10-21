@@ -252,6 +252,14 @@ fn cmd_hidpi(token: Option<&str>, extra: Option<&str>, displays: &[DisplayInfo])
     println!("hidpi on  {} - now rendered at {}x{} (undo: monctl hidpi off {})", d.describe(), cur.width * 2, cur.height * 2, d.id);
 }
 
+/// What `list` shows: displays in use, plus ones monctl turned off. Idle GPU
+/// heads and the outputs of virtual adapters other apps install (Windows
+/// lists every one of them as a display) are noise unless asked for (--all).
+fn listed<'a>(displays: &'a [DisplayInfo], all: bool) -> Vec<&'a DisplayInfo> {
+    let state = common::load_state();
+    displays.iter().filter(|d| all || d.active || d.mirror_of.is_some() || state.contains_key(&d.id)).collect()
+}
+
 fn print_list(displays: &[DisplayInfo]) {
     fn pad(s: &str, n: usize) -> String {
         if s.chars().count() >= n {
@@ -260,8 +268,10 @@ fn print_list(displays: &[DisplayInfo]) {
             format!("{s}{}", " ".repeat(n - s.chars().count()))
         }
     }
+    let all = std::env::args().any(|a| a == "--all" || a == "-a");
+    let shown = listed(displays, all);
     println!("id              state     main  detail                         name");
-    for d in displays {
+    for d in &shown {
         let state = if d.mirror_of.is_some() {
             "mirror"
         } else if d.active {
@@ -281,15 +291,21 @@ fn print_list(displays: &[DisplayInfo]) {
     let state = common::load_state();
     let seen: BTreeSet<&String> = displays.iter().map(|d| &d.id).collect();
     let active_names: BTreeSet<&str> = displays.iter().filter(|d| d.active).map(|d| d.name.as_str()).collect();
+    let mut ghosts = 0;
     for (id, name) in &state {
         // a remembered id gone from the OS while an active display has the
         // same name = the same panel under a new id, not a third screen
         if !seen.contains(id) && !active_names.contains(name.as_str()) {
             println!("{} {} {} {} {}", pad(id, 15), pad("off*", 9), pad("", 5), pad("-", 30), name);
+            ghosts += 1;
         }
     }
-    if !state.is_empty() {
+    if ghosts > 0 {
         println!("(off* = turned off by monctl, bring back with `monctl all`)");
+    }
+    let hidden = displays.len() - shown.len();
+    if hidden > 0 {
+        println!("({hidden} idle output{} hidden - `monctl list --all` shows them)", if hidden == 1 { "" } else { "s" });
     }
 }
 

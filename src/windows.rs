@@ -208,18 +208,59 @@ fn any_real_mode(device: &str) -> Option<DEVMODEW> {
     best
 }
 
-/// EDID monitor name attached to an adapter ("DELL P2314H"), falling back to
-/// the adapter string ("NVIDIA GeForce RTX 4070") when no monitor is attached.
-fn monitor_name(adapter: &str) -> Option<String> {
-    let wide = string_to_wide(adapter);
-    let mut dd = DISPLAY_DEVICEW::new();
-    if unsafe { EnumDisplayDevicesW(wide.as_ptr(), 0, &mut dd, EDD_GET_DEVICE_INTERFACE_NAME) } != 0 {
-        let s = wide_to_string(&dd.device_string);
-        if !s.is_empty() {
-            return Some(s);
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegGetValueW(key: isize, subkey: *const WCHAR, value: *const WCHAR, flags: DWORD, kind: *mut DWORD, data: *mut c_void, size: *mut DWORD) -> LONG;
+}
+const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
+const RRF_RT_REG_BINARY: DWORD = 0x0000_0008;
+
+/// The monitor's own name from its EDID ("DELL P2314H"). Windows only shows
+/// "Generic PnP Monitor" as the device string; the EDID sits in the registry
+/// under the monitor's PnP instance, which the interface path encodes:
+/// \\?\DISPLAY#DEL40A3#5&2e9f3c2&0&UID4352#{guid} -> Enum\DISPLAY\DEL40A3\5&2e9f3c2&0&UID4352
+fn edid_name(interface_path: &str) -> Option<String> {
+    let mut parts = interface_path.trim_start_matches("\\\\?\\").split('#');
+    let (class, model, instance) = (parts.next()?, parts.next()?, parts.next()?);
+    let key = string_to_wide(&format!("SYSTEM\\CurrentControlSet\\Enum\\{class}\\{model}\\{instance}\\Device Parameters"));
+    let value = string_to_wide("EDID");
+    let mut buf = [0u8; 256];
+    let mut size = buf.len() as DWORD;
+    let rc = unsafe {
+        RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), value.as_ptr(), RRF_RT_REG_BINARY, std::ptr::null_mut(), buf.as_mut_ptr().cast(), &mut size)
+    };
+    if rc != 0 || size < 128 {
+        return None;
+    }
+    edid_product_name(&buf[..size as usize])
+}
+
+/// Display product name descriptor (tag 0xFC) of an EDID base block.
+fn edid_product_name(edid: &[u8]) -> Option<String> {
+    for off in [54, 72, 90, 108] {
+        let d = edid.get(off..off + 18)?;
+        if d[..3] == [0, 0, 0] && d[3] == 0xFC {
+            let name: String = d[5..].iter().take_while(|&&b| b != b'\n').map(|&b| b as char).collect();
+            let name = name.trim().to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
         }
     }
     None
+}
+
+/// Monitor attached to an adapter: (name, connected). The name prefers the
+/// EDID, then the monitor driver's string; None when no monitor is there.
+fn monitor(adapter: &str) -> Option<(String, bool)> {
+    let wide = string_to_wide(adapter);
+    let mut dd = DISPLAY_DEVICEW::new();
+    if unsafe { EnumDisplayDevicesW(wide.as_ptr(), 0, &mut dd, EDD_GET_DEVICE_INTERFACE_NAME) } == 0 {
+        return None;
+    }
+    let connected = dd.state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0; // monitor-level: "active"
+    let name = edid_name(&wide_to_string(&dd.device_id)).unwrap_or_else(|| wide_to_string(&dd.device_string));
+    Some((name, connected))
 }
 
 pub fn list() -> Vec<DisplayInfo> {
@@ -242,7 +283,7 @@ pub fn list() -> Vec<DisplayInfo> {
                     format!("{}x{}{} ({},{})", dm.dm_pels_width, dm.dm_pels_height, r, x, y)
                 })
                 .unwrap_or_else(|| "n/a".into());
-            let name = monitor_name(&device).unwrap_or(description);
+            let name = monitor(&device).map(|m| m.0).filter(|n| !n.is_empty()).unwrap_or(description);
             DisplayInfo {
                 id: device,
                 active,
@@ -418,4 +459,16 @@ pub fn set_main(id: &str) -> Result<(), String> {
 
 pub fn set_mirror(_id: &str, _master: Option<&str>) -> Result<(), String> {
     Err("per-display mirroring isn't exposed by Windows - use Win+P \"Duplicate\"".into())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn edid_name_descriptor() {
+        let mut edid = [0u8; 128];
+        edid[72..77].copy_from_slice(&[0, 0, 0, 0xFC, 0]);
+        edid[77..90].copy_from_slice(b"DELL P2314H\n ");
+        assert_eq!(super::edid_product_name(&edid).as_deref(), Some("DELL P2314H"));
+        assert_eq!(super::edid_product_name(&[0u8; 128]), None);
+    }
 }
