@@ -129,6 +129,29 @@ private func agentRunsMe() -> Bool {
     return out.contains("pid = \(getpid())")
 }
 
+/// The program a LaunchAgent plist starts, if any.
+private func agentProgram() -> String? {
+    guard let dict = NSDictionary(contentsOf: agentPlistURL()),
+          let args = dict["ProgramArguments"] as? [String] else { return nil }
+    return args.first
+}
+
+/// One tray at a time, and login starts *this* copy: when monctl.app replaces
+/// an older build (e.g. ~/.local/bin/monctl-tray), end the old process and
+/// point an existing start-at-login entry at us. The entry is only rewritten,
+/// never created - the user's 开机启动 choice is kept.
+private func takeOverFromOlderCopies() {
+    // only the installed app takes over; dev/test builds leave everything be
+    guard binaryPath().contains(".app/Contents/MacOS/") else { return }
+    let me = getpid()
+    for app in NSWorkspace.shared.runningApplications where app.processIdentifier != me {
+        if app.executableURL?.lastPathComponent == "monctl-tray" { app.terminate() }
+    }
+    if agentInstalled(), let prog = agentProgram(), prog != binaryPath() {
+        try? writeAgentPlist() // takes effect at next login; no restart now
+    }
+}
+
 private func writeAgentPlist() throws {
     let plist = """
     <?xml version="1.0" encoding="UTF-8"?>
@@ -164,32 +187,49 @@ private func monctlPath() -> String? {
     return nil
 }
 
-private func runMonctlAwake(_ args: [String]) {
+/// Run `monctl awake ...`; `done` runs on the main thread once it has exited
+/// (by then the new state is on disk, so a menu rebuilt then is accurate).
+private func runMonctlAwake(_ args: [String], done: @escaping () -> Void) {
     guard let monctl = monctlPath() else { return }
     let p = Process()
     p.executableURL = URL(fileURLWithPath: monctl)
     p.arguments = ["awake"] + args
-    p.standardOutput = Pipe()
-    p.standardError = Pipe()
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    p.terminationHandler = { _ in DispatchQueue.main.async(execute: done) }
     try? p.run()
 }
 
-/// nil when nothing is holding; otherwise remaining seconds and whether the
-/// screen is kept on (the hold's --display flag).
-private func awakeState() -> (remaining: Double?, display: Bool) {
+private struct AwakeState {
+    let remaining: Double
+    let requested: Double? // nil = until released
+    let display: Bool
+}
+
+private let foreverSecs: Double = 10 * 365 * 24 * 3600
+
+/// The live hold from awake.json (a flat JSON object of strings), or nil.
+private func awakeState() -> AwakeState? {
     let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("monctl/awake.json")
-    guard let s = try? String(contentsOf: url, encoding: .utf8) else { return (nil, false) }
-    func num(_ key: String) -> Double? {
-        guard let r = s.range(of: "\"\(key)\":") else { return nil }
-        let digits = s[r.upperBound...].prefix { $0.isNumber }
-        return Double(digits)
-    }
-    guard let deadline = num("deadline"), let heartbeat = num("heartbeat") else { return (nil, false) }
-    if num("release") == 1 { return (nil, false) }
+    guard let data = try? Data(contentsOf: url),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { return nil }
+    func num(_ key: String) -> Double? { obj[key].flatMap(Double.init) }
+    guard let deadline = num("deadline"), let heartbeat = num("heartbeat") else { return nil }
+    if num("release") == 1 { return nil }
     let now = Date().timeIntervalSince1970
-    if now - heartbeat > 15 { return (nil, false) } // stale holder (crash/reboot)
-    return (max(0, deadline - now), num("display") == 1)
+    if now - heartbeat > 15 { return nil } // stale holder (crash/reboot)
+    let requested = num("requested").flatMap { $0 > 0 && $0 < foreverSecs ? $0 : nil }
+    return AwakeState(remaining: max(0, deadline - now), requested: requested, display: num("display") == 1)
+}
+
+/// `awake` arguments for a duration (nil = until released) with or without
+/// the screen kept on - so 屏幕常亮 and the durations never undo each other.
+private func awakeArgs(_ secs: Double?, display: Bool) -> [String] {
+    var a: [String] = []
+    if let s = secs { a.append(String(max(1, Int(s)))) }
+    if display { a.append("--display") }
+    return a
 }
 
 private func fmtRemaining(_ secs: Double) -> String {
@@ -416,6 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        takeOverFromOlderCopies()
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "monctl")
             button.image?.isTemplate = true
@@ -442,7 +483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshVirtuals() {
         DispatchQueue.global().async {
             let v = virtualDisplays()
-            DispatchQueue.main.async { self.virtuals = v; self.rebuildMenu() }
+            DispatchQueue.main.async { self.virtuals = v }
         }
     }
 
@@ -459,10 +500,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        rebuildMenu()
-        refreshVirtuals()
-    }
+    func menuNeedsUpdate(_ menu: NSMenu) { rebuildMenu() }
+
+    // `monctl virtual` is a process spawn: refresh the cached list after the
+    // menu closes, so an open menu is never rebuilt under the cursor
+    func menuDidClose(_ menu: NSMenu) { refreshVirtuals() }
 
     private func addItem(_ title: String, action: Selector, target: AnyObject? = nil, enabled: Bool = true, id: CGDirectDisplayID? = nil) {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
@@ -500,38 +542,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         addDisplayTools(displays.filter(\.active))
         menu.addItem(.separator())
-        if let monctl = monctlPath() {
-            let (remaining, displayHold) = awakeState()
+        if monctlPath() != nil {
+            let awake = awakeState()
+            let displayHold = awake?.display ?? false
             let keep = NSMenuItem(title: "屏幕常亮", action: #selector(toggleKeepDisplay(_:)), keyEquivalent: "")
             keep.target = self
             keep.state = displayHold ? .on : .off
             menu.addItem(keep)
             let awakeTitle: String
-            if let r = remaining {
-                awakeTitle = r > 5 * 365 * 24 * 3600
-                    ? "保持唤醒（不限时\(displayHold ? "，屏幕常亮" : "")）"
-                    : "保持唤醒（剩余 \(fmtRemaining(r))\(displayHold ? "，屏幕常亮" : "")）"
+            if let a = awake {
+                let left = a.requested == nil ? "不限时" : "剩余 \(fmtRemaining(a.remaining))"
+                awakeTitle = "保持唤醒（\(left)\(displayHold ? "，屏幕常亮" : "")）"
             } else {
                 awakeTitle = "保持唤醒"
             }
             let awakeItem = NSMenuItem(title: awakeTitle, action: nil, keyEquivalent: "")
             let sub = NSMenu()
-            for (label, secs) in [("1 小时", "3600"), ("4 小时", "14400"), ("8 小时", "28800"), ("不限时", "")] {
+            sub.autoenablesItems = false
+            for (label, secs) in [("1 小时", 3600.0), ("4 小时", 14400.0), ("8 小时", 28800.0), ("不限时", 0.0)] {
                 let it = NSMenuItem(title: label, action: #selector(awakeFor(_:)), keyEquivalent: "")
                 it.target = self
-                it.isEnabled = remaining == nil || secs == ""
-                it.representedObject = secs as NSString
+                it.representedObject = NSNumber(value: secs)
+                // the active duration is ticked; any other can be picked directly
+                if let a = awake { it.state = (a.requested ?? 0) == secs ? .on : .off }
                 sub.addItem(it)
             }
             sub.addItem(.separator())
-            let off = NSMenuItem(title: "解除保持", action: #selector(awakeFor(_:)), keyEquivalent: "")
+            let off = NSMenuItem(title: "解除保持", action: #selector(awakeOff), keyEquivalent: "")
             off.target = self
-            off.isEnabled = remaining != nil
-            off.representedObject = "off" as NSString
+            off.isEnabled = awake != nil
             sub.addItem(off)
             awakeItem.submenu = sub
             menu.addItem(awakeItem)
-            _ = monctl
         }
         let autoStart = NSMenuItem(title: "开机启动", action: #selector(toggleAutoStart(_:)), keyEquivalent: "")
         autoStart.target = self
@@ -541,6 +583,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func submenuItem(_ title: String, _ sub: NSMenu) -> NSMenuItem {
+        sub.autoenablesItems = false // honour isEnabled (autoenable ignores it)
         let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         it.submenu = sub
         return it
@@ -707,19 +750,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func awakeFor(_ sender: NSMenuItem) {
-        guard let arg = (sender.representedObject as? String) else { return }
-        runMonctlAwake(arg == "" ? [] : [arg])
-        statusItem.menu?.cancelTracking()
-        rebuildMenu()
+        guard let secs = (sender.representedObject as? NSNumber)?.doubleValue else { return }
+        // a duration changes how long, not whether the screen stays on
+        let display = awakeState()?.display ?? false
+        runMonctlAwake(awakeArgs(secs > 0 ? secs : nil, display: display)) { self.rebuildMenu() }
     }
 
-    /// One-click "keep the screen on": an unlimited awake hold with --display,
-    /// released the same way. Shares the single hold with 保持唤醒.
+    @objc private func awakeOff() {
+        runMonctlAwake(["off"]) { self.rebuildMenu() }
+    }
+
+    /// 屏幕常亮: flips the screen flag, keeps the current duration; switching it
+    /// off ends a hold that only existed for it.
     @objc private func toggleKeepDisplay(_ sender: NSMenuItem) {
-        let (_, displayHold) = awakeState()
-        runMonctlAwake(displayHold ? ["off"] : ["--display"])
-        statusItem.menu?.cancelTracking()
-        rebuildMenu()
+        let args: [String]
+        switch awakeState() {
+        case let a? where a.display && a.requested == nil: args = ["off"]
+        case let a? where a.display: args = ["display", "off"]
+        default: args = ["display", "on"] // starts an unlimited hold if none
+        }
+        runMonctlAwake(args) { self.rebuildMenu() }
     }
 
     @objc private func toggleAutoStart(_ sender: NSMenuItem) {

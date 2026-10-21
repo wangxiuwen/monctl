@@ -62,6 +62,7 @@ monctl cast [--port 端口] [--display ID|main] [--bitrate Mbps]           macOS
 
 monctl awake [时长]          阻止休眠（2h、90m、2h30m、3600；不带时长 = 直到解除）
 monctl awake off|status      解除 / 查看保持状态（--display 连屏幕一起常亮）
+monctl awake display on|off  只开 / 关屏幕常亮，不改保持时长
 monctl sleep                 立即休眠
 ```
 

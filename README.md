@@ -68,6 +68,7 @@ monctl cast [--port N] [--display ID|main] [--bitrate MBPS]          macOS
 
 monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)
 monctl awake off|status      release / inspect the hold (--display also keeps the screen on)
+monctl awake display on|off  keep the screen on (or not) without changing the duration
 monctl sleep                 suspend the machine now
 ```
 

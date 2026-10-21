@@ -311,12 +311,30 @@ fn active_hold() -> Option<Hold> {
     Some(h)
 }
 
+/// Live hold as the trays need it: seconds left, the requested duration
+/// (None = until released) and whether the screen is kept on too.
+pub struct Status {
+    pub remaining: u64,
+    pub requested: Option<u64>,
+    pub display: bool,
+}
+
+pub fn current() -> Option<Status> {
+    let h = active_hold()?;
+    Some(Status {
+        remaining: h.deadline.saturating_sub(now()),
+        requested: (h.requested > 0 && h.requested < FOREVER_SECS).then_some(h.requested),
+        display: h.display,
+    })
+}
+
 fn status() {
     match active_hold() {
         None => println!("awake: no hold active"),
         Some(h) => {
             let remaining = h.deadline.saturating_sub(now());
-            let tail = if h.deadline >= now() + FOREVER_SECS - 60 {
+            // "until released" is what was asked for, not how far away the deadline is
+            let tail = if h.requested == 0 || h.requested >= FOREVER_SECS {
                 String::new()
             } else {
                 format!(", {} left", fmt_remaining(remaining))
@@ -363,6 +381,30 @@ fn hold(secs: u64, display: bool) {
     }
 }
 
+/// Turn "keep the screen on" on/off for the current hold, keeping its
+/// deadline and requested duration (the holder restarts only if the flag
+/// actually changes). With no hold, `on` starts an unlimited one.
+fn set_display(display: bool) {
+    let Some(existing) = active_hold() else {
+        if display {
+            hold(FOREVER_SECS, true);
+        } else {
+            println!("awake: no hold active");
+        }
+        return;
+    };
+    if existing.display == display {
+        println!("awake: screen {} already", if display { "kept on" } else { "allowed to sleep" });
+        return;
+    }
+    kill_pid(existing.holder_pid);
+    remove_hold_file();
+    let holder_pid = spawn_holder(display).unwrap_or_else(|e| crate::common::fail(&e));
+    thread::sleep(Duration::from_millis(700));
+    write_hold(&Hold { holder_pid, heartbeat: now(), display, release: false, ..existing });
+    println!("awake: screen {}", if display { "kept on too" } else { "may sleep again (system still held)" });
+}
+
 fn release() {
     // active_hold() drops stale files: never signal a dead holder's pid,
     // the OS may have handed it to an unrelated process by now
@@ -389,6 +431,11 @@ pub fn run(args: &[String]) -> ! {
         None => hold(FOREVER_SECS, display),
         Some("status") => status(),
         Some("off" | "release") => release(),
+        Some("display") => match tokens.get(1).copied() {
+            Some("on") => set_display(true),
+            Some("off") => set_display(false),
+            _ => crate::common::fail("usage: monctl awake display on|off"),
+        },
         Some(s) => match parse_duration(s) {
             Some(secs) if secs > 0 => hold(secs.min(FOREVER_SECS), display),
             _ => crate::common::fail(&format!("bad duration '{s}' - use e.g. 2h, 90m, 2h30m, 3600")),

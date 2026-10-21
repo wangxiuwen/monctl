@@ -399,44 +399,43 @@ mod tray {
         (HKEY_CURRENT_USER, "monctl-tray".to_string())
     }
 
-    fn spawn_monctl(args: &[&str]) {
-        if let Some(exe) = monctl_exe() {
+    /// Run monctl in the background; once it has exited (its state is on
+    /// disk by then) refresh the tooltip, so the next menu shows the truth.
+    fn spawn_monctl(args: &[&str], hwnd: HWND) {
+        let Some(exe) = monctl_exe() else { return };
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let hwnd_addr = hwnd as usize;
+        std::thread::spawn(move || {
             use std::os::windows::process::CommandExt;
             use std::process::{Command, Stdio};
             const CREATE_NO_WINDOW: DWORD = 0x0800_0000;
             let _ = Command::new(exe)
-                .args(args)
+                .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .creation_flags(CREATE_NO_WINDOW)
-                .spawn();
-        }
+                .status();
+            unsafe { refresh_tooltip(hwnd_addr as HWND) };
+        });
     }
 
-    /// (remaining_secs, requested_secs, screen kept on) of a live awake hold.
-    fn awake_state() -> Option<(u64, u64, bool)> {
-        let p = common::awake_path();
-        let s = std::fs::read_to_string(p).ok()?;
-        let get = |k: &str| -> Option<u64> {
-            let marker = format!("\"{k}\":");
-            let i = s.find(&marker)? + marker.len();
-            let rest = &s[i..];
-            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-            rest[..end].parse().ok()
-        };
-        if get("release") == Some(1) {
-            return None;
+    /// `awake` arguments that keep the current duration but set the screen
+    /// flag, so 屏幕常亮 and the durations never silently undo each other.
+    fn awake_args(secs: Option<u64>, display: bool) -> Vec<String> {
+        let mut a = vec!["awake".to_string()];
+        if let Some(s) = secs {
+            a.push(s.max(1).to_string());
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let heartbeat = get("heartbeat")?;
-        if now.saturating_sub(heartbeat) > 15 {
-            return None;
+        if display {
+            a.push("--display".to_string());
         }
-        Some((get("deadline")?.saturating_sub(now), get("requested").unwrap_or(0), get("display") == Some(1)))
+        a
+    }
+
+    /// The live awake hold, straight from the CLI's own state reader.
+    fn awake_state() -> Option<monctl::awake::Status> {
+        monctl::awake::current()
     }
 
     fn fmt_secs(s: u64) -> String {
@@ -469,8 +468,9 @@ mod tray {
         let active = displays.iter().filter(|d| d.active).count();
         let secondary_on = displays.iter().any(|d| d.active && !d.main);
         let mut tip = format!("monctl · {active} 块屏 · 副屏{}", if secondary_on { "开" } else { "关" });
-        if let Some((r, _, display_hold)) = awake_state() {
-            tip.push_str(&format!(" · 防休眠 {}{}", fmt_secs(r), if display_hold { "，屏幕常亮" } else { "" }));
+        if let Some(a) = awake_state() {
+            let left = if a.requested.is_some() { fmt_secs(a.remaining) } else { "不限时".to_string() };
+            tip.push_str(&format!(" · 防休眠 {left}{}", if a.display { "，屏幕常亮" } else { "" }));
         }
         tip.push_str("（点击打开菜单）");
         let mut n = NOTIFYICONDATAW::new(hwnd);
@@ -536,25 +536,18 @@ mod tray {
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
 
         let awake = awake_state();
-        let display_hold = awake.map(|(_, _, d)| d).unwrap_or(false);
+        let display_hold = awake.as_ref().is_some_and(|a| a.display);
         let kd_flags = MF_STRING | if display_hold { MF_CHECKED } else { 0 };
         AppendMenuW(menu, kd_flags, ID_KEEP_DISPLAY as WPARAM, wide("屏幕常亮").as_ptr());
-        let awake_label = match awake {
-            Some((r, _, _)) if r > 5 * 365 * 24 * 3600 => {
-                format!("保持唤醒（不限时{}）", if display_hold { "，屏幕常亮" } else { "" })
-            }
-            Some((r, _, _)) => {
-                format!("保持唤醒（剩余 {}{}）", fmt_secs(r), if display_hold { "，屏幕常亮" } else { "" })
-            }
+        let awake_label = match &awake {
+            Some(a) if a.requested.is_none() => format!("保持唤醒（不限时{}）", if display_hold { "，屏幕常亮" } else { "" }),
+            Some(a) => format!("保持唤醒（剩余 {}{}）", fmt_secs(a.remaining), if display_hold { "，屏幕常亮" } else { "" }),
             None => "保持唤醒".to_string(),
         };
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wide(&awake_label).as_ptr());
         for (i, (label, secs)) in AWAKE_SECS.iter().enumerate() {
-            // tick the duration currently on hold (互斥单选)
-            let checked = match awake {
-                Some((_, requested, _)) => requested == *secs,
-                None => false,
-            };
+            // tick the duration on hold (互斥单选); 0 = 不限时 = no requested duration
+            let checked = awake.as_ref().is_some_and(|a| a.requested.unwrap_or(0) == *secs);
             let flags = MF_STRING | if checked { MF_CHECKED } else { 0 };
             AppendMenuW(menu, flags, (ID_AWAKE_BASE + 10 + i as u32) as WPARAM, wide(label).as_ptr());
         }
@@ -644,78 +637,88 @@ mod tray {
         }
         match id {
             ID_SOLO => {
-                std::thread::spawn(|| {
-                    let displays = monctl::windows::list();
-                    for d in displays.iter().filter(|d| d.active && !d.main) {
+                let hwnd_addr = hwnd as usize;
+                std::thread::spawn(move || {
+                    let hwnd = hwnd_addr as HWND;
+                    let (mut done, mut failed) = (0, 0);
+                    for d in monctl::windows::list().iter().filter(|d| d.active && !d.main) {
                         if monctl::windows::set_enabled(&d.id, false).is_ok() {
                             let mut st = common::load_state();
                             st.insert(d.id.clone(), d.name.clone());
                             common::save_state(&st);
+                            done += 1;
+                        } else {
+                            failed += 1;
                         }
+                    }
+                    let body = match (done, failed) {
+                        (0, 0) => "只有主屏在亮，无需操作".to_string(),
+                        (n, 0) => format!("已关闭 {n} 块副屏"),
+                        (n, f) => format!("已关闭 {n} 块副屏，{f} 块关闭失败（驱动不允许）"),
+                    };
+                    unsafe {
+                        notify(hwnd, "只留主屏", &body);
+                        refresh_tooltip(hwnd);
                     }
                 });
             }
             ID_ALL => {
-                std::thread::spawn(|| {
+                let hwnd_addr = hwnd as usize;
+                std::thread::spawn(move || {
+                    let hwnd = hwnd_addr as HWND;
                     let displays = monctl::windows::list();
                     let mut ids: Vec<String> = displays.iter().filter(|d| !d.active).map(|d| d.id.clone()).collect();
                     ids.extend(common::load_state().keys().cloned());
+                    ids.sort();
+                    ids.dedup();
                     ids.retain(|id| !displays.iter().any(|d| d.id == *id && d.active));
+                    let mut done = 0;
                     for id in ids {
                         if monctl::windows::set_enabled(&id, true).is_ok() {
                             let mut st = common::load_state();
                             st.remove(&id);
                             common::save_state(&st);
+                            done += 1;
                         }
+                        // phantom outputs (no panel) can't attach: not worth an error
+                    }
+                    let body = if done == 0 { "所有屏幕都已开启".to_string() } else { format!("已开启 {done} 块屏") };
+                    unsafe {
+                        notify(hwnd, "全部开启", &body);
+                        refresh_tooltip(hwnd);
                     }
                 });
             }
             i if (ID_AWAKE_BASE + 10..=ID_AWAKE_BASE + 13).contains(&i) => {
-                let secs = AWAKE_SECS[(i - ID_AWAKE_BASE - 10) as usize].1;
-                if secs == 0 {
-                    spawn_monctl(&["awake"]);
-                } else {
-                    spawn_monctl(&["awake", &secs.to_string()]);
-                }
-                let label = AWAKE_SECS[(i - ID_AWAKE_BASE - 10) as usize].0.to_string();
+                let (label, secs) = AWAKE_SECS[(i - ID_AWAKE_BASE - 10) as usize];
+                // keep 屏幕常亮 as it is: a duration only changes how long
+                let display = awake_state().is_some_and(|a| a.display);
+                let args = awake_args((secs > 0).then_some(secs), display);
+                spawn_monctl(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), hwnd);
                 unsafe {
                     notify(hwnd, "保持唤醒", &format!("已选择 {label}，防休眠生效中"));
                 }
-                // awake.json is written by the spawned monctl ~0.7s later;
-                // refresh the tooltip once that state is on disk
-                let hwnd_addr = hwnd as usize;
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    unsafe { refresh_tooltip(hwnd_addr as HWND) };
-                });
             }
             i if i == ID_AWAKE_BASE + 14 => {
-                spawn_monctl(&["awake", "off"]);
+                spawn_monctl(&["awake", "off"], hwnd);
                 unsafe {
                     notify(hwnd, "保持唤醒", "已解除");
                 }
-                let hwnd_addr = hwnd as usize;
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    unsafe { refresh_tooltip(hwnd_addr as HWND) };
-                });
             }
             ID_KEEP_DISPLAY => {
-                // one-click screen-sleep prevention: unlimited hold with --display
-                let turning_off = awake_state().map(|(_, _, d)| d).unwrap_or(false);
-                if turning_off {
-                    spawn_monctl(&["awake", "off"]);
-                } else {
-                    spawn_monctl(&["awake", "--display"]);
-                }
+                // 屏幕常亮 flips the screen flag and keeps the current duration;
+                // turning it off ends a hold that only existed for it
+                let cur = awake_state();
+                let turning_off = cur.as_ref().is_some_and(|a| a.display);
+                let args: &[&str] = match &cur {
+                    Some(a) if turning_off && a.requested.is_none() => &["awake", "off"],
+                    _ if turning_off => &["awake", "display", "off"],
+                    _ => &["awake", "display", "on"], // starts an unlimited hold if none
+                };
+                spawn_monctl(args, hwnd);
                 unsafe {
                     notify(hwnd, "屏幕常亮", if turning_off { "已关闭，屏幕可正常休眠" } else { "已开启：屏幕不再休眠，直到再次点击" });
                 }
-                let hwnd_addr = hwnd as usize;
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    unsafe { refresh_tooltip(hwnd_addr as HWND) };
-                });
             }
             ID_AUTOSTART => {
                 let on = !autostart_enabled();
