@@ -220,6 +220,10 @@ fn main() {
         "-h" | "--help" | "help" => usage(),
         "awake" => awake::run(&args[1..]),
         "sleep" => awake::sleep_now(),
+        #[cfg(target_os = "macos")]
+        "virtual" | "virt" => monctl::virt::run(&args[1..]),
+        #[cfg(not(target_os = "macos"))]
+        "virtual" | "virt" => fail("virtual displays are macOS-only for now (Windows needs an indirect display driver)"),
         _ => {}
     }
 
