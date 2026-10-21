@@ -1,6 +1,6 @@
 [package]
 name = "monctl"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "The screen assistant: displays on/off, resolutions & HiDPI, mirroring, virtual displays, tablets as extra screens (macOS / Windows / Linux)"
 license = "MIT"
