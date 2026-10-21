@@ -207,7 +207,10 @@ mod inhibit {
             // display sleep is X11/screen-saver territory; we inhibit the system only
             let _ = display;
             let child = Command::new("systemd-inhibit")
-                .args(["--what=sleep:idle", "--mode=block", "sleep", "315360000"])
+                // the inhibited command watches the holder pid, so a killed or
+                // crashed holder can't leave an orphan blocking sleep for years
+                .args(["--what=sleep:idle", "--mode=block", "sh", "-c"])
+                .arg(format!("while kill -0 {} 2>/dev/null; do sleep 2; done", std::process::id()))
                 .stdin(Stdio::null())
                 .spawn()
                 .ok();
@@ -351,7 +354,9 @@ fn hold(secs: u64, display: bool) {
 }
 
 fn release() {
-    let Some(h) = read_hold() else {
+    // active_hold() drops stale files: never signal a dead holder's pid,
+    // the OS may have handed it to an unrelated process by now
+    let Some(h) = active_hold() else {
         println!("awake: no hold active");
         return;
     };

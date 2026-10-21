@@ -229,7 +229,12 @@ fn main() {
                 run_enable(false, &[t], true);
             }
             Some(t) => match find_display(&displays, t) {
-                Some(d) => run_enable(!d.active, std::slice::from_ref(d), true),
+                // turning off goes through the same last-screen guard as `off`
+                Some(d) if d.active => {
+                    let t = resolve_off_target(Some(t), &displays);
+                    run_enable(false, &[t], true);
+                }
+                Some(d) => run_enable(true, std::slice::from_ref(d), true),
                 None => {
                     if common::load_state().contains_key(t) {
                         run_enable(true, &[ghost(t, &common::load_state())], true);
