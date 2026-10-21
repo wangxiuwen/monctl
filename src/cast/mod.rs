@@ -17,7 +17,7 @@ use crate::common::fail;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 #[cfg(unix)]
 use std::ffi::{c_char, c_void};
@@ -47,13 +47,16 @@ pub(crate) enum Packet {
 }
 
 /// The tablet's first message.
+#[derive(Clone)]
 pub(crate) struct Hello {
+    /// the line as sent, to hand on to the worker serving the tablet (macOS)
+    #[cfg_attr(windows, allow(dead_code))]
+    pub raw: String,
     pub width: u32,
     pub height: u32,
     pub dpr: f64,
-    /// stable per tablet (localStorage): macOS keys the virtual display's
-    /// identity on it; the Windows driver has no per-monitor identity
-    #[cfg_attr(windows, allow(dead_code))]
+    /// stable per tablet (localStorage): a tablet that comes back gets its
+    /// screen back; macOS also keys the virtual display's identity on it
     pub client: String,
     pub label: String,
 }
@@ -228,8 +231,17 @@ fn handle(mut sock: TcpStream, opts: &Options) {
         let _ = write!(sock, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
         // nothing past the headers can be buffered yet: the page only talks
         // after it has seen our 101
+        // first message: "h <css width> <css height> <devicePixelRatio> <client id> <label...>"
+        // (the page only talks after it has seen our 101). Read here, so a
+        // tablet that comes back can be routed to the screen it left.
+        let hello = match ws_read(&mut reader) {
+            Some((1, p)) => parse_hello(&String::from_utf8_lossy(&p)),
+            _ => None,
+        };
         drop(reader);
-        platform::dispatch(sock, opts);
+        if let Some(hello) = hello {
+            platform::dispatch(sock, hello, opts);
+        }
     } else if path == "/status" {
         let body = format!(
             "{{\"tablets\":{},\"url\":\"{}\"}}",
@@ -262,47 +274,47 @@ fn reply(sock: &mut TcpStream, kind: &str, body: &str) {
     let _ = write!(sock, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len());
 }
 
-pub(crate) fn session(sock: TcpStream, opts: &Options) {
-    let _ = sock.set_nodelay(true);
-    let mut reader = match sock.try_clone() {
-        Ok(s) => BufReader::new(s),
-        Err(_) => return,
-    };
-    let peer = sock.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-    // first message: "h <css width> <css height> <devicePixelRatio> <client id> <label...>"
-    let hello = match ws_read(&mut reader) {
-        Some((1, p)) => String::from_utf8_lossy(&p).to_string(),
-        _ => return,
-    };
-    let f: Vec<&str> = hello.splitn(6, ' ').collect();
+pub(crate) fn parse_hello(raw: &str) -> Option<Hello> {
+    let f: Vec<&str> = raw.splitn(6, ' ').collect();
     if f.first() != Some(&"h") || f.len() < 5 {
-        return;
+        return None;
     }
     let num = |i: usize| f.get(i).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-    let hello = Hello {
+    Some(Hello {
+        raw: raw.to_string(),
         width: num(1).round() as u32,
         height: num(2).round() as u32,
         dpr: num(3),
         client: f[4].to_string(),
         label: f.get(5).copied().unwrap_or("tablet").to_string(),
-    };
-    let (tx, rx) = sync_channel::<Packet>(8);
-    let mut screen = match platform::open(&hello, opts, tx) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("monctl cast: {}: {e}", hello.label);
-            let mut s = &sock;
-            let _ = ws_send(&mut s, 1, format!("err {e}").as_bytes());
-            return;
-        }
-    };
+    })
+}
+
+/// End a connection because the same tablet connected again (the newer one
+/// gets the screen). The page then stops reconnecting this one.
+pub(crate) fn replaced(sock: &TcpStream) {
+    let mut s = sock;
+    let _ = ws_send(&mut s, 1, b"bye replaced");
+    let _ = sock.shutdown(std::net::Shutdown::Both);
+}
+
+/// Tell the page why it gets no screen.
+pub(crate) fn refuse(sock: &TcpStream, hello: &Hello, e: &str) {
+    eprintln!("monctl cast: {}: {e}", hello.label);
+    let mut s = sock;
+    let _ = ws_send(&mut s, 1, format!("err {e}").as_bytes());
+}
+
+/// Serve one connected tablet until it leaves: frames out, input in. The
+/// screen is dropped (capture stops) when the tablet goes; whether the
+/// display itself stays for a while is up to the platform.
+pub(crate) fn run_session(sock: TcpStream, hello: &Hello, mut screen: Box<dyn Screen>, rx: Receiver<Packet>) {
+    let _ = sock.set_nodelay(true);
+    let peer = sock.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     println!("+ {} ({peer}, {}x{} @{}x) -> display {}", hello.label, hello.width, hello.height, hello.dpr, screen.display());
-    let writer = {
-        let mut out = match sock.try_clone() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        std::thread::spawn(move || writer_loop(&mut out, rx))
+    let (mut reader, writer) = match (sock.try_clone(), sock.try_clone()) {
+        (Ok(r), Ok(mut w)) => (BufReader::new(r), std::thread::spawn(move || writer_loop(&mut w, rx))),
+        _ => return,
     };
     while let Some((op, payload)) = ws_read(&mut reader) {
         match op {
@@ -329,16 +341,21 @@ pub(crate) fn session(sock: TcpStream, opts: &Options) {
 }
 
 fn writer_loop(out: &mut TcpStream, rx: Receiver<Packet>) {
-    for p in rx {
-        let r = match p {
-            Packet::Config { codec, avcc, width, height } => ws_send(out, 1, format!("cfg {codec} {width} {height} {}", base64(&avcc)).as_bytes()),
-            Packet::Frame { key, ts_us, data } => {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        let r = match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(Packet::Config { codec, avcc, width, height }) => ws_send(out, 1, format!("cfg {codec} {width} {height} {}", base64(&avcc)).as_bytes()),
+            Ok(Packet::Frame { key, ts_us, data }) => {
                 let mut buf = Vec::with_capacity(data.len() + 9);
                 buf.push(key as u8);
                 buf.extend_from_slice(&ts_us.to_be_bytes());
                 buf.extend_from_slice(&data);
                 ws_send(out, 2, &buf)
             }
+            // a still screen sends nothing: the heartbeat tells the page the
+            // link is alive (and us, eventually, that it isn't)
+            Err(RecvTimeoutError::Timeout) => ws_send(out, 1, b"hb"),
+            Err(RecvTimeoutError::Disconnected) => break,
         };
         if r.is_err() {
             break;

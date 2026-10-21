@@ -70,11 +70,11 @@ function screenSize() {
 const T = (navigator.language || "").toLowerCase().startsWith("zh") ? {
   connecting: "正在连接…", waiting: "等待画面…", reconnecting: "连接断开，正在重连…", retrying: "（正在重试…）",
   noPlayer: "这个浏览器播放不了画面。\n请用 Chrome、Edge 或 Safari 13 以上（用 USB 线连接延迟最低）。",
-  keyboard: "⌨  键盘", fullscreen: "⛶  全屏",
+  keyboard: "⌨  键盘", fullscreen: "⛶  全屏", replaced: "这块屏已在另一个页面打开。",
 } : {
   connecting: "connecting…", waiting: "waiting for the first frame…", reconnecting: "reconnecting…", retrying: "(retrying…)",
   noPlayer: "This browser can't play the stream.\nTry Chrome, Edge or Safari 13+ (open the page over USB for the best latency).",
-  keyboard: "⌨  Keyboard", fullscreen: "⛶  Full screen",
+  keyboard: "⌨  Keyboard", fullscreen: "⛶  Full screen", replaced: "This screen was opened in another tab.",
 };
 $("kb").textContent = T.keyboard;
 $("fs").textContent = T.fullscreen;
@@ -177,15 +177,22 @@ function chase() {
 
 // ---------- connection ----------
 let retry = 0, lastError = "";
+let lastMessage = 0, stopped = false;
 function connect() {
+  if (stopped) return;
   const [w, h] = screenSize();
   sentSize = `${w}x${h}`;
-  ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.binaryType = "arraybuffer";
+  // events of an older socket (a reconnect raced its close) must not touch
+  // the current one - each handler checks it is still the live socket
+  const sock = new WebSocket(`ws://${location.host}/ws`);
+  ws = sock;
+  sock.binaryType = "arraybuffer";
   // back-off resets only once frames flow: a server that accepts and then
   // fails must not be hammered every 500ms
-  ws.onopen = () => { show(T.waiting); ws.send(`h ${w} ${h} ${devicePixelRatio} ${clientId} ${label}`); };
-  ws.onmessage = ev => {
+  sock.onopen = () => { lastMessage = Date.now(); show(T.waiting); sock.send(`h ${w} ${h} ${devicePixelRatio} ${clientId} ${label}`); };
+  sock.onmessage = ev => {
+    if (ws !== sock) return;
+    lastMessage = Date.now();
     if (typeof ev.data === "string") {
       const [kind, ...rest] = ev.data.split(" ");
       if (kind === "cfg") {
@@ -196,7 +203,8 @@ function connect() {
         else if (!mse) setupMSE(codec, avcc, frameW, frameH);
         else mse.queue.push(initSegment(avcc, frameW, frameH));
       } else if (kind === "err") { lastError = rest.join(" "); show(lastError); retry = Math.max(retry, 4); }
-      return;
+      else if (kind === "bye") { stopped = true; show(T.replaced); } // this tablet opened the screen elsewhere
+      return; // "hb": just the heartbeat
     }
     const buf = new Uint8Array(ev.data), key = buf[0] === 1;
     if (waitKey && !key) return;
@@ -210,12 +218,21 @@ function connect() {
       mse.queue.push(fragment(data, key)); pump();
     }
   };
-  ws.onclose = () => {
+  sock.onclose = () => {
+    if (ws !== sock || stopped) return;
     show(lastError ? `${lastError}\n${T.retrying}` : T.reconnecting);
     if (mse) { try { URL.revokeObjectURL(video.src); } catch (e) {} mse = null; seq = 0; decodeTime = 0; }
     setTimeout(connect, Math.min(10000, 500 * 2 ** retry++));
   };
 }
+// The server sends a heartbeat every few seconds even on a still screen.
+// Silence means a dead connection the browser hasn't noticed (Wi-Fi drop,
+// tablet slept): drop it and reconnect - the screen is waiting for us.
+function checkAlive() {
+  if (!stopped && ws && ws.readyState === 1 && Date.now() - lastMessage > 10000) ws.close();
+}
+setInterval(checkAlive, 2000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { checkAlive(); if (ws && ws.readyState > 1) { retry = 0; connect(); } } });
 function send(s) { if (ws && ws.readyState === 1) ws.send(s); }
 setInterval(() => {
   info.textContent = frames ? `${frames} fps · ${(bytes * 8 / 1e6).toFixed(1)} Mbit/s · ${useWebCodecs ? "USB" : "Wi-Fi"}` : "";

@@ -570,10 +570,105 @@ pub(super) fn resolve_display(token: &str) -> Result<String, String> {
     token.parse::<u32>().map(|d| d.to_string()).map_err(|_| format!("bad --display id '{token}'"))
 }
 
-/// The server hands each tablet's socket to its own worker process.
-pub(super) fn dispatch(sock: TcpStream, opts: &Options) {
-    if let Err(e) = spawn_worker(&sock, opts) {
-        eprintln!("monctl cast: cannot start a session: {e}");
+// ------------------------------------------------- workers, handover ----
+//
+// One worker process per tablet. A process that connected to the
+// WindowServer before a display existed never sees that display's modes (its
+// CoreGraphics cache doesn't refresh, even with a run loop), while the
+// process that *creates* a virtual display always sees it. So the worker
+// creates, captures and encodes its own screen, and the screen ends with the
+// process - nothing can leak.
+//
+// When its tablet leaves, the worker keeps the screen (and the windows on
+// it) for a while. If the same tablet comes back - it slept, reloaded, hopped
+// Wi-Fi - the server passes the new connection to that worker over a control
+// socket (SCM_RIGHTS) instead of starting a fresh screen.
+
+/// Live workers by tablet: (control socket, worker pid, tablet connected now).
+static WORKERS: Mutex<Vec<(String, std::os::unix::net::UnixStream, u32, bool)>> = Mutex::new(Vec::new());
+const KEEP: Duration = Duration::from_secs(60);
+
+#[repr(C)]
+struct IoVec {
+    base: *mut c_void,
+    len: usize,
+}
+
+#[repr(C)]
+struct MsgHdr {
+    name: *mut c_void,
+    name_len: u32,
+    iov: *mut IoVec,
+    iov_len: i32,
+    control: *mut c_void,
+    control_len: u32,
+    flags: i32,
+}
+
+extern "C" {
+    fn sendmsg(fd: i32, msg: *const MsgHdr, flags: i32) -> isize;
+    fn recvmsg(fd: i32, msg: *mut MsgHdr, flags: i32) -> isize;
+}
+
+// Darwin: cmsghdr is {u32 len, i32 level, i32 type}, data 4-byte aligned
+const SOL_SOCKET: i32 = 0xffff;
+const SCM_RIGHTS: i32 = 1;
+const CMSG_HDR: usize = 12;
+
+/// Send `fd` plus `text` over a Unix socket.
+fn send_fd(ctrl: &std::os::unix::net::UnixStream, fd: i32, text: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut data = text.as_bytes().to_vec();
+    let mut iov = IoVec { base: data.as_mut_ptr().cast(), len: data.len() };
+    let mut control = [0u8; CMSG_HDR + 4];
+    control[..4].copy_from_slice(&((CMSG_HDR + 4) as u32).to_ne_bytes());
+    control[4..8].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+    control[8..12].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+    control[12..16].copy_from_slice(&fd.to_ne_bytes());
+    let msg = MsgHdr { name: std::ptr::null_mut(), name_len: 0, iov: &mut iov, iov_len: 1, control: control.as_mut_ptr().cast(), control_len: control.len() as u32, flags: 0 };
+    if unsafe { sendmsg(ctrl.as_raw_fd(), &msg, 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Receive a socket + text sent by `send_fd` (honours the read timeout).
+fn recv_fd(ctrl: &std::os::unix::net::UnixStream) -> std::io::Result<(TcpStream, String)> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut data = [0u8; 2048];
+    let mut iov = IoVec { base: data.as_mut_ptr().cast(), len: data.len() };
+    let mut control = [0u8; 64];
+    let mut msg = MsgHdr { name: std::ptr::null_mut(), name_len: 0, iov: &mut iov, iov_len: 1, control: control.as_mut_ptr().cast(), control_len: control.len() as u32, flags: 0 };
+    let n = unsafe { recvmsg(ctrl.as_raw_fd(), &mut msg, 0) };
+    if n <= 0 {
+        return Err(if n == 0 { std::io::ErrorKind::UnexpectedEof.into() } else { std::io::Error::last_os_error() });
+    }
+    let level = i32::from_ne_bytes(control[4..8].try_into().unwrap());
+    let kind = i32::from_ne_bytes(control[8..12].try_into().unwrap());
+    if msg.control_len < (CMSG_HDR + 4) as u32 || level != SOL_SOCKET || kind != SCM_RIGHTS {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    let fd = i32::from_ne_bytes(control[12..16].try_into().unwrap());
+    Ok((unsafe { TcpStream::from_raw_fd(fd) }, String::from_utf8_lossy(&data[..n as usize]).to_string()))
+}
+
+/// The server routes each tablet: back to the worker still holding its
+/// screen, or to a new one.
+pub(super) fn dispatch(sock: TcpStream, hello: Hello, opts: &Options) {
+    use std::os::fd::AsRawFd;
+    // Newest connection wins: a tablet that dropped off Wi-Fi often leaves a
+    // half-open connection behind, so "still connected" must not mean "new
+    // screen" - its worker swaps the old connection for this one.
+    let mut workers = WORKERS.lock().unwrap();
+    if let Some(i) = workers.iter().position(|w| w.0 == hello.client) {
+        if send_fd(&workers[i].1, sock.as_raw_fd(), &hello.raw).is_ok() {
+            return; // our copy of the socket closes here; the worker has its own
+        }
+        workers.remove(i); // that worker is gone
+    }
+    drop(workers);
+    if let Err(e) = spawn_worker(&sock, &hello, opts) {
+        super::refuse(&sock, &hello, &format!("cannot start a session: {e}"));
     }
 }
 
@@ -583,8 +678,77 @@ pub(super) fn shutdown() -> ! {
     std::process::exit(0)
 }
 
-/// `monctl cast --worker`: run one session on the socket handed over as fd 3.
+fn serial_for(client: &str) -> u32 {
+    let h = sha1(client.as_bytes());
+    0x1000 + (u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 0xE000)
+}
+
+fn spawn_worker(sock: &TcpStream, hello: &Hello, opts: &Options) -> std::io::Result<()> {
+    use std::io::BufRead;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    extern "C" {
+        fn dup2(from: i32, to: i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    }
+    const F_SETFD: i32 = 2;
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    let (fd, ctrl) = (sock.as_raw_fd(), theirs.as_raw_fd());
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.args(["cast", "--worker", "--bitrate", &opts.bitrate_mbps.to_string()]);
+    if let Some(d) = &opts.display {
+        cmd.args(["--display", d]);
+    }
+    if !opts.hidpi {
+        cmd.arg("--no-hidpi");
+    }
+    cmd.env("MONCTL_HELLO", &hello.raw);
+    // the tablet's socket becomes the worker's fd 3, the control socket fd 4
+    // (dup2 clears close-on-exec; a fd already in place needs it cleared by hand)
+    unsafe {
+        cmd.pre_exec(move || {
+            for (from, to) in [(fd, 3), (ctrl, 4)] {
+                let r = if from == to { fcntl(to, F_SETFD, 0) } else { dup2(from, to) };
+                if r < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn()?;
+    drop(theirs);
+    let pid = child.id();
+    WORKERS.lock().unwrap().push((hello.client.clone(), ours.try_clone()?, pid, false));
+    // the worker reports "+" / "-" as its tablet comes and goes
+    let reports = std::io::BufReader::new(ours);
+    std::thread::spawn(move || {
+        let set = |connected: bool| {
+            if let Some(w) = WORKERS.lock().unwrap().iter_mut().find(|w| w.2 == pid) {
+                if w.3 != connected {
+                    w.3 = connected;
+                    if connected {
+                        super::TABLETS.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        super::TABLETS.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        };
+        for line in reports.lines().map_while(Result::ok) {
+            set(line == "+");
+        }
+        set(false);
+        WORKERS.lock().unwrap().retain(|w| w.2 != pid);
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// `monctl cast --worker`: serve this tablet (fd 3, hello in the
+/// environment), then keep its screen for a while for it to come back.
 pub(super) fn worker(opts: &Options) -> ! {
+    use std::io::Write;
     use std::os::fd::FromRawFd;
     // stopping `monctl cast` (Ctrl+C, the tray's "stop") must take every
     // tablet screen with it: a worker whose server is gone ends itself
@@ -598,66 +762,72 @@ pub(super) fn worker(opts: &Options) -> ! {
             std::process::exit(0);
         }
     });
-    super::session(unsafe { TcpStream::from_raw_fd(3) }, opts);
+    let mut ctrl = unsafe { std::os::unix::net::UnixStream::from_raw_fd(4) };
+    let mut sock = unsafe { TcpStream::from_raw_fd(3) };
+    let mut hello = std::env::var("MONCTL_HELLO").ok().and_then(|h| super::parse_hello(&h)).unwrap_or_else(|| std::process::exit(1));
+    // connections handed over by the server; a new one replaces the current
+    let current: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
+    let (handover, next) = std::sync::mpsc::channel::<(TcpStream, Hello)>();
+    {
+        let (ctrl, current) = (ctrl.try_clone().unwrap_or_else(|_| std::process::exit(1)), current.clone());
+        std::thread::spawn(move || {
+            while let Ok((s, raw)) = recv_fd(&ctrl) {
+                let Some(h) = super::parse_hello(&raw) else { continue };
+                if let Some(old) = current.lock().unwrap().take() {
+                    super::replaced(&old);
+                }
+                if handover.send((s, h)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let mut display = MacDisplay { owned: None, size: (0, 0, false), id: 0 };
+    loop {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Packet>(8);
+        match open(&mut display, &hello, opts, tx) {
+            Ok(screen) => {
+                *current.lock().unwrap() = sock.try_clone().ok();
+                let _ = ctrl.write_all(b"+\n");
+                super::run_session(sock, &hello, screen, rx);
+                current.lock().unwrap().take();
+                let _ = ctrl.write_all(b"-\n");
+            }
+            Err(e) => super::refuse(&sock, &hello, &e),
+        }
+        // keep the screen; the server hands this tablet back if it returns
+        match next.recv_timeout(KEEP) {
+            Ok((s, h)) => {
+                sock = s;
+                hello = h;
+            }
+            Err(_) => break, // didn't come back (or the server is gone)
+        }
+    }
+    drop(display); // the virtual display goes with us
     std::process::exit(0)
 }
 
-fn serial_for(client: &str) -> u32 {
-    let h = sha1(client.as_bytes());
-    0x1000 + (u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 0xE000)
+/// The tablet's virtual display, owned by the worker across reconnects.
+struct MacDisplay {
+    owned: Option<virt::Id>,
+    size: (u32, u32, bool),
+    id: u32,
 }
 
-/// One process per tablet session. A process that connected to the
-/// WindowServer before a display existed never sees that display's modes
-/// (its CoreGraphics cache doesn't refresh, even with a run loop), while the
-/// process that *creates* a virtual display always sees it. So the worker
-/// creates, captures and encodes its own screen - and when the tablet goes
-/// away the process ends and the screen with it: nothing can leak.
-fn spawn_worker(sock: &TcpStream, opts: &Options) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::process::CommandExt;
-    extern "C" {
-        fn dup2(from: i32, to: i32) -> i32;
-        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+impl Drop for MacDisplay {
+    fn drop(&mut self) {
+        if let Some(d) = self.owned.take() {
+            unsafe { virt::release(d) };
+        }
     }
-    const F_SETFD: i32 = 2;
-    let fd = sock.as_raw_fd();
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.args(["cast", "--worker", "--bitrate", &opts.bitrate_mbps.to_string()]);
-    if let Some(d) = &opts.display {
-        cmd.args(["--display", d]);
-    }
-    if !opts.hidpi {
-        cmd.arg("--no-hidpi");
-    }
-    // the session socket becomes the worker's fd 3 (dup2 clears close-on-exec;
-    // if it already is 3, clear the flag by hand)
-    unsafe {
-        cmd.pre_exec(move || {
-            let r = if fd == 3 { fcntl(3, F_SETFD, 0) } else { dup2(fd, 3) };
-            if r < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = cmd.spawn()?;
-    // a worker lives exactly as long as its tablet is connected
-    super::TABLETS.fetch_add(1, Ordering::Relaxed);
-    std::thread::spawn(move || {
-        let _ = child.wait();
-        super::TABLETS.fetch_sub(1, Ordering::Relaxed);
-    });
-    Ok(())
 }
-
 
 struct MacScreen {
     capture: Option<Capture>,
     input: Input,
     can_input: bool,
     display: u32,
-    owned: Option<virt::Id>,
 }
 
 impl Screen for MacScreen {
@@ -676,35 +846,31 @@ impl Screen for MacScreen {
     }
 }
 
-impl Drop for MacScreen {
-    fn drop(&mut self) {
-        self.capture.take(); // stop capturing before the display goes away
-        if let Some(d) = self.owned.take() {
-            unsafe { virt::release(d) };
-        }
-    }
-}
-
-/// Stream an existing display, or create one shaped like the tablet.
-pub(super) fn open(hello: &Hello, opts: &Options, tx: SyncSender<Packet>) -> Result<Box<dyn Screen>, String> {
-    let mut owned = None;
-    let display = match &opts.display {
+/// Stream an existing display, or the tablet's own virtual one - kept from
+/// its last visit when the size still fits, (re)created otherwise.
+fn open(display: &mut MacDisplay, hello: &Hello, opts: &Options, tx: SyncSender<Packet>) -> Result<Box<dyn Screen>, String> {
+    let id = match &opts.display {
         Some(d) => d.parse().map_err(|_| format!("bad display id {d}"))?,
         None => {
             let hidpi = opts.hidpi && hello.dpr >= 1.5;
-            let spec = virt::Spec { width: hello.width.clamp(640, 4096) & !1, height: hello.height.clamp(480, 4096) & !1, hz: 60, hidpi };
-            let (d, id) = unsafe { virt::create(&spec, serial_for(&hello.client), &hello.label) }.map_err(|e| format!("cannot create a screen: {e}"))?;
-            owned = Some(d);
-            id
+            let size = (hello.width.clamp(640, 4096) & !1, hello.height.clamp(480, 4096) & !1, hidpi);
+            if display.owned.is_none() || display.size != size {
+                // a rotated tablet: the old screen goes first (it has our serial)
+                if let Some(d) = display.owned.take() {
+                    unsafe { virt::release(d) };
+                }
+                let spec = virt::Spec { width: size.0, height: size.1, hz: 60, hidpi };
+                let (d, id) = unsafe { virt::create(&spec, serial_for(&hello.client), &hello.label) }.map_err(|e| format!("cannot create a screen: {e}"))?;
+                *display = MacDisplay { owned: Some(d), size, id };
+            }
+            display.id
         }
     };
-    let mut screen = MacScreen {
-        capture: None,
-        input: Input { display, left_down: false, last_click: std::time::Instant::now() - Duration::from_secs(1), clicks: 0 },
+    let capture = Capture::start(id, opts.bitrate_mbps, tx)?;
+    Ok(Box::new(MacScreen {
+        capture: Some(capture),
+        input: Input { display: id, left_down: false, last_click: std::time::Instant::now() - Duration::from_secs(1), clicks: 0 },
         can_input: input_allowed(false),
-        display,
-        owned,
-    };
-    screen.capture = Some(Capture::start(display, opts.bitrate_mbps, tx)?); // on error the drop releases the display
-    Ok(Box::new(screen))
+        display: id,
+    }))
 }

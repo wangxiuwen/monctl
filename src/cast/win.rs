@@ -964,6 +964,33 @@ impl Input {
 /// Tablets on a monitor of the driver's pool: (session id, pool monitor).
 static TABLETS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Screens of tablets that just left: (client id, pool monitor, until). A
+/// tablet that sleeps, reloads or hops Wi-Fi comes back to the same screen -
+/// with its windows still on it - instead of a fresh one.
+static KEPT: Mutex<Vec<(String, String, Instant)>> = Mutex::new(Vec::new());
+const KEEP: Duration = Duration::from_secs(60);
+
+/// Park the screens whose tablet didn't come back in time.
+fn keep_reaper() {
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let _tablets = TABLETS.lock().unwrap(); // no claim in between
+        let mut kept = KEPT.lock().unwrap();
+        let now = Instant::now();
+        let mut changed = false;
+        kept.retain(|(_, name, until)| {
+            if *until > now {
+                return true;
+            }
+            let _ = crate::windows::set_enabled(name, false);
+            changed = true;
+            false
+        });
+        if changed {
+            reassert_off();
+        }
+    }
+}
 
 /// A topology change makes Windows re-apply its saved layout, which can turn
 /// back on screens the user switched off with monctl: undo that.
@@ -978,6 +1005,7 @@ fn reassert_off() {
 
 struct WinScreen {
     id: u64,
+    client: String,
     shared: Arc<Shared>,
     input: Input,
     threads: Vec<std::thread::JoinHandle<()>>,
@@ -1007,9 +1035,9 @@ impl Drop for WinScreen {
         if self.pooled {
             let mut tablets = TABLETS.lock().unwrap();
             if let Some(i) = tablets.iter().position(|t| t.0 == self.id) {
+                // stays on the desktop for a while in case the tablet comes back
                 let (_, name) = tablets.remove(i);
-                let _ = crate::windows::set_enabled(&name, false); // back to the pool, off the desktop
-                reassert_off();
+                KEPT.lock().unwrap().push((self.client.clone(), name, Instant::now() + KEEP));
             }
         }
     }
@@ -1042,6 +1070,7 @@ pub(super) fn prepare(opts: &Options) {
             crate::common::fail(&format!("tablet screens need the virtual display driver: {e}"));
         }
         winvdd::park(); // start clean: leftovers of a crashed run
+        std::thread::spawn(keep_reaper);
     }
 }
 
@@ -1058,10 +1087,35 @@ pub(super) fn resolve_display(token: &str) -> Result<String, String> {
 
 /// Sessions run on the connection's thread: no CoreGraphics-style per-process
 /// cache to dodge on Windows, and the monitor pool must be shared anyway.
-pub(super) fn dispatch(sock: std::net::TcpStream, opts: &Options) {
-    super::TABLETS.fetch_add(1, Ordering::Relaxed);
-    super::session(sock, opts);
-    super::TABLETS.fetch_sub(1, Ordering::Relaxed);
+/// Live sessions: (session number, tablet, its socket) - to replace one.
+static LIVE: Mutex<Vec<(u64, String, std::net::TcpStream)>> = Mutex::new(Vec::new());
+
+pub(super) fn dispatch(sock: std::net::TcpStream, hello: Hello, opts: &Options) {
+    // Newest connection wins: a tablet that dropped off Wi-Fi often leaves a
+    // half-open connection behind; end it, and once its screen is handed
+    // back (kept for this tablet), this connection takes it over.
+    let old: Vec<std::net::TcpStream> = LIVE.lock().unwrap().iter().filter(|l| l.1 == hello.client).filter_map(|l| l.2.try_clone().ok()).collect();
+    if !old.is_empty() {
+        old.iter().for_each(super::replaced);
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until && LIVE.lock().unwrap().iter().any(|l| l.1 == hello.client) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Packet>(8);
+    match open(&hello, opts, tx) {
+        Ok(screen) => {
+            let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            if let Ok(c) = sock.try_clone() {
+                LIVE.lock().unwrap().push((n, hello.client.clone(), c));
+            }
+            super::TABLETS.fetch_add(1, Ordering::Relaxed);
+            super::run_session(sock, &hello, screen, rx); // the screen is kept for this tablet when it returns
+            super::TABLETS.fetch_sub(1, Ordering::Relaxed);
+            LIVE.lock().unwrap().retain(|l| l.0 != n);
+        }
+        Err(e) => super::refuse(&sock, &hello, &e),
+    }
 }
 
 /// Stop casting. Sessions live in this process, so their screens must be
@@ -1080,7 +1134,7 @@ pub(super) fn worker(_opts: &Options) -> ! {
     crate::common::fail("--worker is a macOS-only internal mode")
 }
 
-pub(super) fn open(hello: &Hello, opts: &Options, tx: SyncSender<Packet>) -> Result<Box<dyn Screen>, String> {
+fn open(hello: &Hello, opts: &Options, tx: SyncSender<Packet>) -> Result<Box<dyn Screen>, String> {
     let shared = Arc::new(Shared {
         slot: Slot { frame: Mutex::new(None), ready: Condvar::new() },
         stop: AtomicBool::new(false),
@@ -1099,10 +1153,24 @@ pub(super) fn open(hello: &Hello, opts: &Options, tx: SyncSender<Packet>) -> Res
         if !winvdd::ping() || !winvdd::pool_ready() {
             winvdd::ensure().map_err(|e| format!("cannot add a screen: {e}"))?;
         }
-        let free = winvdd::pool().into_iter().find(|m| !tablets.iter().any(|t| t.1 == *m));
-        let Some(name) = free else {
-            return Err(format!("up to {} tablets at a time", winvdd::POOL));
+        let mut kept = KEPT.lock().unwrap();
+        let name = if let Some(i) = kept.iter().position(|k| k.0 == hello.client) {
+            kept.remove(i).1 // this tablet's own screen, still there
+        } else {
+            let pool = winvdd::pool();
+            let free = |kept: &Vec<(String, String, Instant)>| pool.iter().find(|m| !tablets.iter().any(|t| t.1 == **m) && !kept.iter().any(|k| k.1 == **m)).cloned();
+            match free(&kept) {
+                Some(n) => n,
+                // pool full: the screen kept longest gives way
+                None if !kept.is_empty() => {
+                    let (_, n, _) = kept.remove(0);
+                    let _ = crate::windows::set_enabled(&n, false);
+                    n
+                }
+                None => return Err(format!("up to {} tablets at a time", winvdd::POOL)),
+            }
         };
+        drop(kept);
         let (gw, gh) = winvdd::claim(&name, w, h).map_err(|e| format!("cannot add a screen: {e}"))?;
         if (gw, gh) != (w, h) {
             eprintln!("monctl cast: {}: {w}x{h} isn't offered yet, using {gw}x{gh} (exact from the next driver start)", hello.label);
@@ -1128,7 +1196,7 @@ pub(super) fn open(hello: &Hello, opts: &Options, tx: SyncSender<Packet>) -> Res
             std::thread::spawn(move || encode_loop(s, tx, bitrate))
         },
     ];
-    Ok(Box::new(WinScreen { id, input: Input { shared: shared.clone() }, shared, threads, pooled }))
+    Ok(Box::new(WinScreen { id, client: hello.client.clone(), input: Input { shared: shared.clone() }, shared, threads, pooled }))
 }
 
 #[cfg(test)]
