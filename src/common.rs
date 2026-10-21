@@ -12,23 +12,31 @@ pub fn fail(msg: &str) -> ! {
 
 /// CLI usage text; also the help back end for `awake` with bad arguments.
 pub fn usage() -> ! {
+    // raw string: a `\` line continuation would eat each line's indentation
     print!(
-        "monctl - turn individual displays on/off (as if unplugged)\n\
-\n\
-usage:\n\
-  monctl list                  show all connected displays\n\
-  monctl off  [ID|main]        disable a display        (default: the non-main one)\n\
-  monctl on   [ID|main|all]    enable display(s)        (default: all that are off)\n\
-  monctl toggle [ID|main]      flip one display\n\
-  monctl solo [ID|main]        keep only one display on (default: main)\n\
-  monctl all                   enable every connected display\n\
-  monctl forget [ID|all]       drop remembered off-state entries\n\
-\n\
-  monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)\n\
-  monctl awake off|status      release / inspect the hold (--display also keeps the screen on)\n\
-  monctl sleep                 suspend the machine now\n\
-\n\
-state made with off/solo lasts until logout/reboot - `monctl all` brings everything back.\n"
+        r#"monctl - the screen assistant: turn displays on/off (as if unplugged), resolutions, mirroring, virtual screens
+
+usage:
+  monctl list                  show all connected displays
+  monctl off  [ID|main]        disable a display        (default: the non-main one)
+  monctl on   [ID|main|all]    enable display(s)        (default: all that are off)
+  monctl toggle [ID|main]      flip one display
+  monctl solo [ID|main]        keep only one display on (default: main)
+  monctl all                   enable every connected display
+  monctl forget [ID|all]       drop remembered off-state entries
+
+  monctl mode [ID] [WxH[@Hz]|N]  list / switch resolutions (HiDPI included; --lodpi for 1x)
+  monctl main ID               make a display the main one (menu bar, Dock / taskbar)
+  monctl mirror ID [SOURCE]    show SOURCE (default: main) on display ID; `mirror off` undoes
+  monctl hidpi [ID] | off [ID] macOS: crisp HiDPI rendering on any monitor
+  monctl virtual [add [WxH[@Hz]] [--name N] [--no-hidpi] | rm ID|all]   macOS: virtual displays
+
+  monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)
+  monctl awake off|status      release / inspect the hold (--display also keeps the screen on)
+  monctl sleep                 suspend the machine now
+
+state made with off/solo lasts until logout/reboot - `monctl all` brings everything back.
+"#
     );
     std::process::exit(0);
 }
@@ -42,12 +50,48 @@ pub struct DisplayInfo {
     pub main: bool,
     pub name: String,
     pub detail: String,
+    /// id of the display this one mirrors (shows the same picture as)
+    pub mirror_of: Option<String>,
 }
 
 impl DisplayInfo {
     pub fn describe(&self) -> String {
         format!("{} \"{}\" ({})", self.id, self.name, self.detail)
     }
+}
+
+/// One display mode. `width`/`height` is what the desktop looks like
+/// (points); `pixel_*` is what is rendered - twice as big for HiDPI modes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mode {
+    pub width: u32,
+    pub height: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub hz: u32,
+    pub current: bool,
+}
+
+impl Mode {
+    pub fn hidpi(&self) -> bool {
+        self.pixel_width > self.width
+    }
+
+    pub fn describe(&self) -> String {
+        let hz = if self.hz > 0 { format!(" @{}Hz", self.hz) } else { String::new() };
+        let dpi = if self.hidpi() { format!("  HiDPI ({}x{})", self.pixel_width, self.pixel_height) } else { String::new() };
+        format!("{}x{}{hz}{dpi}", self.width, self.height)
+    }
+}
+
+/// Pick the mode a user means by "WxH[@Hz]": exact size, preferring the
+/// requested refresh rate (else the highest), then HiDPI unless `lodpi`.
+pub fn pick_mode(modes: &[Mode], w: u32, h: u32, hz: Option<u32>, lodpi: bool) -> Option<&Mode> {
+    modes
+        .iter()
+        .filter(|m| m.width == w && m.height == h)
+        .filter(|m| hz.is_none_or(|z| m.hz == z || m.hz == 0))
+        .max_by_key(|m| (m.hidpi() != lodpi, m.hz))
 }
 
 /// Displays turned off by monctl: id -> friendly name.
@@ -211,6 +255,19 @@ pub fn json_parse_object(s: &str) -> Option<OffState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mode(w: u32, h: u32, pw: u32, hz: u32) -> Mode {
+        Mode { width: w, height: h, pixel_width: pw, pixel_height: pw * h / w, hz, current: false }
+    }
+
+    #[test]
+    fn pick_prefers_hidpi_and_high_refresh() {
+        let modes = [mode(1920, 1080, 1920, 60), mode(1920, 1080, 3840, 60), mode(1920, 1080, 1920, 120), mode(2560, 1440, 2560, 60)];
+        assert_eq!(pick_mode(&modes, 1920, 1080, None, false), Some(&modes[1]));
+        assert_eq!(pick_mode(&modes, 1920, 1080, None, true), Some(&modes[2]));
+        assert_eq!(pick_mode(&modes, 1920, 1080, Some(60), true), Some(&modes[0]));
+        assert_eq!(pick_mode(&modes, 1280, 720, None, false), None);
+    }
 
     #[test]
     fn json_roundtrip() {

@@ -1,7 +1,7 @@
 // Linux backend — X11 via xrandr; KDE Wayland via kscreen-doctor.
 // GNOME Wayland has no stable public interface for disabling outputs yet (see README).
 
-use crate::common::DisplayInfo;
+use crate::common::{DisplayInfo, Mode};
 use std::process::Command;
 
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
@@ -63,6 +63,7 @@ fn xrandr_list() -> Result<Vec<DisplayInfo>, String> {
             main,
             name: name.to_string(),
             detail: geometry.unwrap_or_else(|| "n/a".into()),
+            mirror_of: None,
         });
     }
     if displays.is_empty() {
@@ -116,6 +117,7 @@ fn kscreen_list() -> Result<Vec<DisplayInfo>, String> {
             main,
             name: id,
             detail: if enabled { "enabled".into() } else { "disabled".into() },
+            mirror_of: None,
         });
     }
     if displays.is_empty() {
@@ -152,8 +154,128 @@ pub fn set_enabled(id: &str, enable: bool) -> Result<(), String> {
     }
 }
 
+// ---- modes / primary / mirroring ----
+
+fn mode(w: u32, h: u32, hz: u32, current: bool) -> Mode {
+    Mode { width: w, height: h, pixel_width: w, pixel_height: h, hz, current }
+}
+
+/// Mode lines under an output's header in `xrandr --query`:
+/// "   1920x1080     60.00*+  59.94    50.00"
+fn parse_xrandr_modes(out: &str, id: &str) -> Vec<Mode> {
+    let mut modes = vec![];
+    let mut inside = false;
+    for line in out.lines() {
+        if !line.starts_with(' ') {
+            inside = line.split_whitespace().next() == Some(id);
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        let mut t = line.split_whitespace();
+        let Some((w, h)) = t.next().and_then(|s| s.split_once('x')) else { continue };
+        let (Ok(w), Ok(h)) = (w.parse(), h.trim_end_matches('i').parse()) else { continue };
+        for rate in t {
+            let current = rate.contains('*');
+            if let Ok(hz) = rate.trim_end_matches(['*', '+']).parse::<f64>() {
+                modes.push(mode(w, h, hz.round() as u32, current));
+            }
+        }
+    }
+    modes
+}
+
+/// kscreen-doctor: "Modes:  1:1920x1080@60*!  2:1280x720@60 ..."
+fn parse_kscreen_modes(out: &str, id: &str) -> Vec<Mode> {
+    let mut modes = vec![];
+    let mut inside = false;
+    for line in strip_ansi(out).lines() {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        if t.first() == Some(&"Output:") {
+            inside = t.get(2) == Some(&id);
+            continue;
+        }
+        if !inside || t.first() != Some(&"Modes:") {
+            continue;
+        }
+        for m in &t[1..] {
+            let spec = m.split_once(':').map_or(*m, |(_, s)| s);
+            let current = spec.contains('*');
+            let spec = spec.trim_end_matches(['*', '!']);
+            let Some((size, hz)) = spec.split_once('@') else { continue };
+            let Some((w, h)) = size.split_once('x') else { continue };
+            if let (Ok(w), Ok(h), Ok(hz)) = (w.parse(), h.parse(), hz.parse::<f64>()) {
+                modes.push(mode(w, h, hz.round() as u32, current));
+            }
+        }
+    }
+    modes
+}
+
+pub fn modes(id: &str) -> Result<Vec<Mode>, String> {
+    let modes = match session() {
+        "wayland" => parse_kscreen_modes(&run("kscreen-doctor", &["-o"])?, id),
+        _ => parse_xrandr_modes(&run("xrandr", &["--query"])?, id),
+    };
+    if modes.is_empty() {
+        return Err(format!("{id} reports no modes"));
+    }
+    Ok(modes)
+}
+
+pub fn set_mode(id: &str, m: &Mode) -> Result<(), String> {
+    let size = format!("{}x{}", m.width, m.height);
+    match session() {
+        "wayland" => run("kscreen-doctor", &[&format!("output.{id}.mode.{size}@{}", m.hz)]).map(|_| ()),
+        _ => run("xrandr", &["--output", id, "--mode", &size, "--rate", &m.hz.to_string()]).map(|_| ()),
+    }
+}
+
+pub fn set_main(id: &str) -> Result<(), String> {
+    match session() {
+        "wayland" => run("kscreen-doctor", &[&format!("output.{id}.priority.1")]).map(|_| ()),
+        _ => run("xrandr", &["--output", id, "--primary"]).map(|_| ()),
+    }
+}
+
+pub fn set_mirror(id: &str, master: Option<&str>) -> Result<(), String> {
+    if session() == "wayland" {
+        return Err("mirroring from the command line needs X11 (xrandr --same-as)".into());
+    }
+    match master {
+        Some(m) => run("xrandr", &["--output", id, "--same-as", m]).map(|_| ()),
+        // back to its own spot: right of the primary output
+        None => {
+            let primary = xrandr_list()?.into_iter().find(|d| d.main && d.id != id);
+            match primary {
+                Some(p) => run("xrandr", &["--output", id, "--auto", "--right-of", &p.id]).map(|_| ()),
+                None => run("xrandr", &["--output", id, "--auto"]).map(|_| ()),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xrandr_modes() {
+        let out = "HDMI-1 connected primary 1920x1080+0+0 (normal) 527mm x 296mm\n   1920x1080     60.00*+  50.00\n   1280x720      60.00\nDP-1 disconnected (normal)\n   1024x768      60.00\n";
+        let m = super::parse_xrandr_modes(out, "HDMI-1");
+        assert_eq!(m.len(), 3);
+        assert!(m[0].current && m[0].hz == 60 && m[0].width == 1920);
+        assert_eq!(m[2].width, 1280);
+    }
+
+    #[test]
+    fn kscreen_modes() {
+        let out = "Output: 1 DP-1 enabled connected priority 1 DisplayPort\n\tModes:  1:2560x1440@60*!  2:1920x1080@59.94\n";
+        let m = super::parse_kscreen_modes(out, "DP-1");
+        assert_eq!(m.len(), 2);
+        assert!(m[0].current && m[0].width == 2560);
+        assert_eq!(m[1].hz, 60);
+    }
+
     #[test]
     fn strip_ansi_removes_csi() {
         assert_eq!(super::strip_ansi("\x1b[01;32mOutput: \x1b[0;0m1 DP-1 enabled"), "Output: 1 DP-1 enabled");

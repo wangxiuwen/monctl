@@ -5,7 +5,7 @@
 // WDDM drivers); a disabled display keeps its registry config, so re-enabling
 // places it to the right of the current desktop.
 
-use crate::common::DisplayInfo;
+use crate::common::{DisplayInfo, Mode};
 use std::ffi::c_void;
 
 type DWORD = u32;
@@ -24,6 +24,7 @@ const DM_PELSHEIGHT: DWORD = 0x0010_0000;
 const DM_DISPLAYFREQUENCY: DWORD = 0x0040_0000;
 const CDS_UPDATEREGISTRY: DWORD = 0x0000_0001;
 const CDS_NORESET: DWORD = 0x1000_0000;
+const CDS_SET_PRIMARY: DWORD = 0x0000_0010;
 const DISP_CHANGE_SUCCESSFUL: LONG = 0;
 
 #[repr(C)]
@@ -248,6 +249,7 @@ pub fn list() -> Vec<DisplayInfo> {
                 main,
                 name: if name.is_empty() { "Display".into() } else { name },
                 detail,
+                mirror_of: None,
             }
         })
         .collect()
@@ -301,9 +303,7 @@ fn best_frequency_at(device: &str, width: DWORD, height: DWORD) -> Option<DWORD>
 }
 
 pub fn set_enabled(id: &str, enable: bool) -> Result<(), String> {
-    if !id.starts_with("\\\\.\\DISPLAY") {
-        return Err(format!("'{id}' is not a valid Windows display id (expected \\\\.\\DISPLAYn, see `monctl list`)"));
-    }
+    check_id(id)?;
     if enable {
         // attach: restore the stored mode (or any real mode), placed to the right of the desktop
         let mut dm = match current_settings(id).filter(|dm| dm.dm_pels_width > 0 && dm.dm_pels_height > 0) {
@@ -336,4 +336,86 @@ pub fn set_enabled(id: &str, enable: bool) -> Result<(), String> {
         dm.dm_pels_height = 0;
         apply(Some(id), &mut dm)
     }
+}
+
+fn check_id(id: &str) -> Result<(), String> {
+    if id.starts_with("\\\\.\\DISPLAY") {
+        Ok(())
+    } else {
+        Err(format!("'{id}' is not a valid Windows display id (expected \\\\.\\DISPLAYn, see `monctl list`)"))
+    }
+}
+
+/// Every mode the driver offers at desktop colour depth. Windows has no
+/// HiDPI modes in this sense (scaling is a separate setting), so pixel = size.
+pub fn modes(id: &str) -> Result<Vec<Mode>, String> {
+    check_id(id)?;
+    let cur = current_settings(id).filter(|dm| dm.dm_pels_width > 0);
+    let wide = string_to_wide(id);
+    let mut out = vec![];
+    for i in 0..1000u32 {
+        let mut dm = DEVMODEW::new();
+        if unsafe { EnumDisplaySettingsW(wide.as_ptr(), i, &mut dm) } == 0 {
+            break;
+        }
+        if dm.dm_pels_width == 0 || dm.dm_bits_per_pel < 32 {
+            continue;
+        }
+        out.push(Mode {
+            width: dm.dm_pels_width,
+            height: dm.dm_pels_height,
+            pixel_width: dm.dm_pels_width,
+            pixel_height: dm.dm_pels_height,
+            hz: dm.dm_display_frequency,
+            current: cur.as_ref().is_some_and(|c| {
+                c.dm_pels_width == dm.dm_pels_width && c.dm_pels_height == dm.dm_pels_height && c.dm_display_frequency == dm.dm_display_frequency
+            }),
+        });
+    }
+    if out.is_empty() {
+        return Err(format!("{id} reports no modes"));
+    }
+    Ok(out)
+}
+
+pub fn set_mode(id: &str, mode: &Mode) -> Result<(), String> {
+    check_id(id)?;
+    let mut dm = current_settings(id).ok_or_else(|| format!("{id} is not active"))?;
+    dm.dm_pels_width = mode.width;
+    dm.dm_pels_height = mode.height;
+    dm.dm_display_frequency = mode.hz;
+    dm.dm_fields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+    apply(Some(id), &mut dm)
+}
+
+/// Make `id` the primary display: it must sit at (0,0), so shift every
+/// active display by its offset in one batched (NORESET) transaction.
+pub fn set_main(id: &str) -> Result<(), String> {
+    check_id(id)?;
+    let target = current_settings(id).filter(|dm| dm.dm_pels_width > 0).ok_or_else(|| format!("{id} is not active"))?;
+    let (ox, oy) = unsafe { (target.u.position.x, target.u.position.y) };
+    for d in list().into_iter().filter(|d| d.active) {
+        let Some(mut dm) = current_settings(&d.id).filter(|dm| dm.dm_pels_width > 0) else { continue };
+        let (x, y) = unsafe { (dm.u.position.x, dm.u.position.y) };
+        dm.u.position = POINTL { x: x - ox, y: y - oy };
+        dm.dm_fields = DM_POSITION;
+        let mut flags = CDS_UPDATEREGISTRY | CDS_NORESET;
+        if d.id == id {
+            flags |= CDS_SET_PRIMARY;
+        }
+        let wide = string_to_wide(&d.id);
+        let rc = unsafe { ChangeDisplaySettingsExW(wide.as_ptr(), &mut dm, std::ptr::null_mut(), flags, std::ptr::null_mut()) };
+        if rc != DISP_CHANGE_SUCCESSFUL {
+            return Err(format!("ChangeDisplaySettingsExW({}) returned {rc}", d.id));
+        }
+    }
+    let rc = unsafe { ChangeDisplaySettingsExW(std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), 0, std::ptr::null_mut()) };
+    if rc != DISP_CHANGE_SUCCESSFUL {
+        return Err(format!("apply (ChangeDisplaySettingsExW) returned {rc}"));
+    }
+    Ok(())
+}
+
+pub fn set_mirror(_id: &str, _master: Option<&str>) -> Result<(), String> {
+    Err("per-display mirroring isn't exposed by Windows - use Win+P \"Duplicate\"".into())
 }
