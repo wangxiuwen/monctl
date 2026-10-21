@@ -343,6 +343,25 @@ private func virtualDisplays() -> [VirtualInfo] {
     }
 }
 
+// MARK: - Sidecar (Apple's own iPad-as-a-display, USB or wireless)
+
+/// Private SidecarCore, kept alive for the app's lifetime so device
+/// discovery runs in the background and the menu lists iPads instantly.
+private let sidecar: NSObject? = {
+    dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore", RTLD_NOW)
+    guard let cls = NSClassFromString("SidecarDisplayManager") as? NSObject.Type,
+          let m = cls.perform(NSSelectorFromString("sharedManager"))?.takeUnretainedValue() as? NSObject else { return nil }
+    return m
+}()
+
+private func sidecarDevices(_ key: String) -> [NSObject] {
+    sidecar?.perform(NSSelectorFromString(key))?.takeUnretainedValue() as? [NSObject] ?? []
+}
+
+private func sidecarName(_ d: NSObject) -> String {
+    (d.value(forKey: "name") as? String) ?? "iPad"
+}
+
 // MARK: - tablet casting (`monctl cast` as a child process)
 
 private final class Caster {
@@ -457,6 +476,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         takeOverFromOlderCopies()
+        _ = sidecar // start Sidecar device discovery now, not when the menu opens
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "monctl")
             button.image?.isTemplate = true
@@ -640,6 +660,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(submenuItem("虚拟显示器", virt))
 
+        // iPads through Apple's Sidecar
+        let side = NSMenu()
+        let connected = Set(sidecarDevices("connectedDevices").map(sidecarName))
+        for d in sidecarDevices("devices") {
+            let name = sidecarName(d)
+            subItem(side, name, #selector(toggleSidecar(_:)), d, checked: connected.contains(name))
+        }
+        if side.items.isEmpty {
+            subItem(side, "没有找到 iPad（需同一 Apple ID，开蓝牙/Wi-Fi 或插 USB 线）", #selector(noop), enabled: false)
+        }
+        menu.addItem(submenuItem("随航到 iPad", side))
+
         // tablets
         if caster.running {
             let n = caster.tablets
@@ -651,6 +683,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func noop() {}
+
+    @objc private func toggleSidecar(_ sender: NSMenuItem) {
+        guard let m = sidecar, let device = sender.representedObject as? NSObject else { return }
+        let name = sidecarName(device)
+        let disconnecting = sender.state == .on
+        let done: @convention(block) (NSError?) -> Void = { [weak self] err in
+            DispatchQueue.main.async {
+                if let err { self?.alert("\(disconnecting ? "断开" : "连接") \(name) 失败：\(err.localizedDescription)") }
+                self?.rebuildMenu()
+            }
+        }
+        let sel = NSSelectorFromString(disconnecting ? "disconnectFromDevice:completion:" : "connectToDevice:completion:")
+        _ = m.perform(sel, with: device, with: done as AnyObject)
+    }
 
     @objc private func pickMode(_ sender: NSMenuItem) {
         guard let pair = sender.representedObject as? NSArray, pair.count == 2,

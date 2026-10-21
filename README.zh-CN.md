@@ -60,6 +60,7 @@ monctl hidpi [ID] | off [ID] macOS：任意显示器开 HiDPI
 monctl virtual [add [WxH[@Hz]] [--name 名字] [--no-hidpi] | rm ID|all]   macOS 虚拟显示器
 monctl cast [--port 端口] [--display ID|main] [--bitrate Mbps]           平板当副屏（macOS、Windows）
 monctl driver [status|install|uninstall|restart]                        Windows：投屏用的屏幕驱动
+monctl sidecar [名字|off]                                               macOS：用苹果随航把 iPad 当屏幕
 
 monctl awake [时长]          阻止休眠（2h、90m、2h30m、3600；不带时长 = 直到解除）
 monctl awake off|status      解除 / 查看保持状态（--display 连屏幕一起常亮）
@@ -159,6 +160,19 @@ USB  Android R58N...: wired via adb, opened http://localhost:8484/ on the tablet
 
 - 抓屏：DXGI 桌面复制；编码：GPU 上的 Media Foundation H.264（NVENC / Quick Sync / AMF），没有则用软件编码。
 - 最多同时 4 台平板。
+
+## iPad 有线：随航（macOS）
+
+iPad 的浏览器没法通过 USB 线访问 Mac，所以有线连 iPad 时，monctl 直接调用苹果自带的随航——
+USB 或无线都行，画质和延迟是 iPad 能拿到的最好的：
+
+```console
+$ monctl sidecar             # 列出 iPad（* = 已连接）
+$ monctl sidecar "William 的 iPad"
+$ monctl sidecar off
+```
+
+菜单栏应用里在 **随航到 iPad** 下面。iPad 需要登录同一个 Apple ID。Windows 上的 iPad 及其他平板都用 `monctl cast`。
 
 ## 防休眠
 

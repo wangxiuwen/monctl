@@ -11,6 +11,8 @@ pub mod linux;
 pub mod macos;
 pub mod qr;
 #[cfg(target_os = "macos")]
+pub mod sidecar;
+#[cfg(target_os = "macos")]
 pub mod virt;
 #[cfg(target_os = "windows")]
 pub mod windows;

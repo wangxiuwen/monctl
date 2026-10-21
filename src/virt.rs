@@ -68,22 +68,22 @@ const PRODUCT_ID: u32 = 0x7663; // "vc"
 const HEARTBEAT_SECS: u64 = 2;
 const STALE_AFTER_SECS: u64 = 15;
 
-fn sel(name: &str) -> Sel {
+pub(crate) fn sel(name: &str) -> Sel {
     let c = CString::new(name).unwrap();
     unsafe { sel_registerName(c.as_ptr()) }
 }
 
-fn class(name: &str) -> Id {
+pub(crate) fn class(name: &str) -> Id {
     let c = CString::new(name).unwrap();
     unsafe { objc_getClass(c.as_ptr()) }
 }
 
 // objc_msgSend must be called through a pointer of the exact method signature.
-fn msg_fn() -> *const c_void {
+pub(crate) fn msg_fn() -> *const c_void {
     objc_msgSend as unsafe extern "C" fn() as *const c_void
 }
 
-unsafe fn send(obj: Id, s: &str) -> Id {
+pub(crate) unsafe fn send(obj: Id, s: &str) -> Id {
     let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(msg_fn());
     f(obj, sel(s))
 }
@@ -118,7 +118,7 @@ unsafe fn new_mode(w: u32, h: u32, hz: f64) -> Id {
     f(send(class("CGVirtualDisplayMode"), "alloc"), sel("initWithWidth:height:refreshRate:"), w, h, hz)
 }
 
-unsafe fn ns_string(s: &str) -> Id {
+pub(crate) unsafe fn ns_string(s: &str) -> Id {
     let c = CString::new(s.replace('\0', "")).unwrap();
     CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), 0x0800_0100) // toll-free bridged to NSString
 }

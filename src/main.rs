@@ -382,6 +382,10 @@ fn main() {
         "cast" | "tablet" => fail("casting to a tablet needs macOS or Windows for now"),
         #[cfg(windows)]
         "driver" => monctl::winvdd::run_cli(&args[1..]),
+        #[cfg(target_os = "macos")]
+        "sidecar" | "ipad" => monctl::sidecar::run(&args[1..]),
+        #[cfg(not(target_os = "macos"))]
+        "sidecar" | "ipad" => fail("Sidecar (iPad as a display) is Apple's, macOS only - on Windows use `monctl cast`"),
         #[cfg(not(target_os = "macos"))]
         "virtual" | "virt" => fail("virtual displays are macOS-only for now (Windows needs an indirect display driver)"),
         _ => {}

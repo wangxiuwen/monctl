@@ -66,6 +66,7 @@ monctl hidpi [ID] | off [ID] macOS: crisp HiDPI rendering on any monitor
 monctl virtual [add [WxH[@Hz]] [--name N] [--no-hidpi] | rm ID|all]   macOS
 monctl cast [--port N] [--display ID|main] [--bitrate MBPS]          macOS, Windows
 monctl driver [status|install|uninstall|restart]                     Windows: cast's screen driver
+monctl sidecar [NAME|off]                                            macOS: iPad via Apple's Sidecar
 
 monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)
 monctl awake off|status      release / inspect the hold (--display also keeps the screen on)
@@ -191,6 +192,21 @@ and scale (an iPad at 2x gets 200%), and hands it back when it leaves.
 - Capture: DXGI Desktop Duplication; encode: Media Foundation H.264 on the
   GPU (NVENC / Quick Sync / AMF), software fallback.
 - Up to 4 tablets at a time.
+
+## iPad over USB: Sidecar (macOS)
+
+An iPad's browser can't reach the Mac through a USB cable, so for a wired
+iPad monctl drives Apple's own Sidecar - USB or wireless, the best picture
+and latency an iPad gets:
+
+```console
+$ monctl sidecar             # list iPads (* = connected)
+$ monctl sidecar "William's iPad"
+$ monctl sidecar off
+```
+
+The menu bar app lists them under **随航到 iPad**. The iPad must be signed in
+to the same Apple ID. On Windows, iPads (and everything else) use `monctl cast`.
 
 ## Keeping the machine awake
 

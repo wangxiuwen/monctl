@@ -32,6 +32,7 @@ usage:
   monctl virtual [add [WxH[@Hz]] [--name N] [--no-hidpi] | rm ID|all]   macOS: virtual displays
   monctl cast [--port N] [--display ID|main]   tablets (iPad/Android/Windows) as extra screens
   monctl driver [status|install|uninstall]     Windows: the screen driver cast uses
+  monctl sidecar [NAME|off]    macOS: iPad as a display via Apple's Sidecar (USB or wireless)
 
   monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)
   monctl awake off|status      release / inspect the hold (--display also keeps the screen on)
