@@ -68,7 +68,7 @@ private func saveState(_ ids: [CGDirectDisplayID: String]) {
     let raw = Dictionary(uniqueKeysWithValues: ids.map { (String($0.key), $0.value) })
     let data = (try? JSONEncoder().encode(raw)) ?? Data("{}".utf8)
     try? FileManager.default.createDirectory(at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try? data.write(to: stateURL)
+    try? data.write(to: stateURL, options: .atomic) // the CLI may read it concurrently
 }
 
 // MARK: - core operation

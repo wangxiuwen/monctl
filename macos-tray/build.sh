@@ -1,12 +1,15 @@
 #!/bin/sh
 # Build the macOS menu bar app and (optionally) register it as a login LaunchAgent.
 set -e
+# usage: build.sh [OUTPUT] | build.sh --install-agent [OUTPUT]
+INSTALL=
+if [ "${1:-}" = "--install-agent" ]; then INSTALL=1; shift; fi
 BIN="${1:-$HOME/.local/bin/monctl-tray}"
 
 swiftc -O "$(dirname "$0")/tray.swift" -o "$BIN"
 echo "built $BIN"
 
-if [ "${1:-}" = "--install-agent" ]; then
+if [ -n "$INSTALL" ]; then
     PLIST="$HOME/Library/LaunchAgents/cn.williamwong.monctl-tray.plist"
     cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

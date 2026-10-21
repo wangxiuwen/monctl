@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Print an error to stderr and exit(1). Used by every front end.
 pub fn fail(msg: &str) -> ! {
@@ -89,11 +89,19 @@ pub fn load_state() -> OffState {
 }
 
 pub fn save_state(state: &OffState) {
-    let path = state_path();
+    write_atomic(&state_path(), &json_write_object(state));
+}
+
+/// Write via a temp file + rename so a concurrent reader (tray, holder
+/// process, another CLI run) never sees a truncated, half-written file.
+pub fn write_atomic(path: &Path, contents: &str) {
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let _ = fs::write(path, json_write_object(state));
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if fs::write(&tmp, contents).is_ok() && fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
 }
 
 // ---- minimal JSON object-of-strings support ----

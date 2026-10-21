@@ -28,8 +28,11 @@ fn now() -> u64 {
 }
 
 fn read_hold() -> Option<Hold> {
-    let raw = std::fs::read_to_string(crate::common::awake_path()).ok()?;
-    let map = json_parse_object(&raw)?;
+    decode_hold(&std::fs::read_to_string(crate::common::awake_path()).ok()?)
+}
+
+fn decode_hold(raw: &str) -> Option<Hold> {
+    let map = json_parse_object(raw)?;
     Some(Hold {
         holder_pid: map.get("holder_pid")?.parse().ok()?,
         deadline: map.get("deadline")?.parse().ok()?,
@@ -41,6 +44,10 @@ fn read_hold() -> Option<Hold> {
 }
 
 fn write_hold(h: &Hold) {
+    crate::common::write_atomic(&crate::common::awake_path(), &encode_hold(h));
+}
+
+fn encode_hold(h: &Hold) -> String {
     let mut map = BTreeMap::new();
     map.insert("holder_pid".to_string(), h.holder_pid.to_string());
     map.insert("deadline".to_string(), h.deadline.to_string());
@@ -48,11 +55,7 @@ fn write_hold(h: &Hold) {
     map.insert("display".to_string(), if h.display { "1" } else { "0" }.to_string());
     map.insert("release".to_string(), if h.release { "1" } else { "0" }.to_string());
     map.insert("requested".to_string(), h.requested.to_string());
-    let path = crate::common::awake_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(path, json_write_object(&map));
+    json_write_object(&map)
 }
 
 fn remove_hold_file() {
@@ -87,12 +90,12 @@ fn parse_duration(s: &str) -> Option<u64> {
         } else {
             let n: u64 = num.parse().ok()?;
             num.clear();
-            total += match c {
+            total = total.checked_add(match c {
                 'h' | 'H' => n.checked_mul(3600)?,
                 'm' | 'M' => n.checked_mul(60)?,
                 's' | 'S' => n,
                 _ => return None,
-            };
+            })?;
         }
     }
     if !num.is_empty() {
@@ -276,12 +279,19 @@ fn spawn_holder(display: bool) -> Result<u32, String> {
 
 fn holder_loop(display: bool) -> ! {
     let _inhibit = inhibit::Inhibit::acquire(display);
+    let path = crate::common::awake_path();
     loop {
         thread::sleep(Duration::from_secs(HOLDER_POLL_SECS));
-        match read_hold() {
+        let Ok(raw) = std::fs::read_to_string(&path) else { break };
+        match decode_hold(&raw) {
             Some(mut h) if !h.release && now() < h.deadline => {
                 h.heartbeat = now();
-                write_hold(&h);
+                // A CLI run may have just extended the deadline or set release:
+                // writing our stale copy back would silently undo it. Skip this
+                // beat if the file changed under us; the next poll picks it up.
+                if std::fs::read_to_string(&path).ok().as_deref() == Some(raw.as_str()) {
+                    write_hold(&h);
+                }
             }
             _ => break,
         }
@@ -380,7 +390,7 @@ pub fn run(args: &[String]) -> ! {
         Some("status") => status(),
         Some("off" | "release") => release(),
         Some(s) => match parse_duration(s) {
-            Some(secs) if secs > 0 => hold(secs, display),
+            Some(secs) if secs > 0 => hold(secs.min(FOREVER_SECS), display),
             _ => crate::common::fail(&format!("bad duration '{s}' - use e.g. 2h, 90m, 2h30m, 3600")),
         },
     }
@@ -389,24 +399,41 @@ pub fn run(args: &[String]) -> ! {
 
 /// Suspend the machine now.
 pub fn sleep_now() -> ! {
-    #[cfg(target_os = "macos")]
-    let mut cmd = Command::new("/usr/bin/pmset");
+    // `rundll32 powrprof.dll,SetSuspendState 0,1,0` is the folk recipe, but
+    // rundll32 calls every entry point as (hwnd, hinst, cmdline, show), so
+    // SetSuspendState's flags receive those values instead of 0,1,0 and
+    // machines with hibernation on hibernate instead of sleeping. Call the
+    // API directly.
     #[cfg(windows)]
-    let mut cmd = Command::new("rundll32.exe");
-    #[cfg(target_os = "linux")]
-    let mut cmd = Command::new("systemctl");
-    #[cfg(target_os = "macos")]
-    cmd.arg("sleepnow");
-    #[cfg(windows)]
-    cmd.args(["powrprof.dll,SetSuspendState", "0,1,0"]);
-    #[cfg(target_os = "linux")]
-    cmd.arg("suspend");
-    match cmd.status() {
-        Ok(s) if s.success() => {
-            println!("sleep: suspending now");
-            std::process::exit(0)
+    {
+        #[link(name = "powrprof")]
+        extern "system" {
+            fn SetSuspendState(hibernate: u8, force: u8, wakeup_events_disabled: u8) -> u8;
         }
-        Ok(s) => crate::common::fail(&format!("suspend request failed (exit {})", s.code().unwrap_or(-1))),
-        Err(e) => crate::common::fail(&format!("cannot run suspend command: {e}")),
+        println!("sleep: suspending now");
+        // returns after resume (non-zero) or immediately on failure (zero)
+        if unsafe { SetSuspendState(0, 0, 0) } == 0 {
+            crate::common::fail(&format!("suspend request failed: {}", std::io::Error::last_os_error()));
+        }
+        std::process::exit(0)
+    }
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_os = "macos")]
+        let mut cmd = Command::new("/usr/bin/pmset");
+        #[cfg(target_os = "macos")]
+        cmd.arg("sleepnow");
+        #[cfg(target_os = "linux")]
+        let mut cmd = Command::new("systemctl");
+        #[cfg(target_os = "linux")]
+        cmd.arg("suspend");
+        match cmd.status() {
+            Ok(s) if s.success() => {
+                println!("sleep: suspending now");
+                std::process::exit(0)
+            }
+            Ok(s) => crate::common::fail(&format!("suspend request failed (exit {})", s.code().unwrap_or(-1))),
+            Err(e) => crate::common::fail(&format!("cannot run suspend command: {e}")),
+        }
     }
 }

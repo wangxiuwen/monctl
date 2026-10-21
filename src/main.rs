@@ -28,13 +28,29 @@ fn ghost(id: &str, state: &OffState) -> DisplayInfo {
     }
 }
 
-/// Find a display by exact id (`\\.\DISPLAY2`) or the short form users type
-/// from `monctl list` output (`DISPLAY2`, or even `2` for macOS-style ids).
-fn find_display<'a>(displays: &'a [DisplayInfo], token: &str) -> Option<&'a DisplayInfo> {
-    if let Some(d) = displays.iter().find(|d| d.id == token) {
-        return Some(d);
+/// Whether a user-typed token names this platform id: the exact id
+/// (`\\.\DISPLAY2`), or the short forms people type from `monctl list`
+/// output (`DISPLAY2`, `display2`, `2`). Whole-name match only - a suffix
+/// match would let `1` hit `\\.\DISPLAY11`.
+fn id_matches(id: &str, token: &str) -> bool {
+    if id == token {
+        return true;
     }
-    displays.iter().find(|d| d.id.ends_with(token) && d.id.len() > token.len() && !token.starts_with('\\'))
+    let short = id.strip_prefix("\\\\.\\").unwrap_or(id);
+    short.eq_ignore_ascii_case(token)
+        || short
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("DISPLAY") && short[7..] == *token)
+}
+
+fn find_display<'a>(displays: &'a [DisplayInfo], token: &str) -> Option<&'a DisplayInfo> {
+    displays.iter().find(|d| id_matches(&d.id, token))
+}
+
+/// Map a token for a display that vanished from the OS to the id we stored
+/// when turning it off, so `monctl on 2` works for `\\.\DISPLAY2` too.
+fn remembered_id(token: &str, state: &OffState) -> String {
+    state.keys().find(|id| id_matches(id, token)).cloned().unwrap_or_else(|| token.to_string())
 }
 
 fn resolve_off_target(token: Option<&str>, displays: &[DisplayInfo]) -> DisplayInfo {
@@ -54,6 +70,9 @@ fn resolve_off_target(token: Option<&str>, displays: &[DisplayInfo]) -> DisplayI
             None => fail(&format!("display '{t}' is not connected (run `monctl list`)")),
         },
     };
+    if !target.active {
+        fail(&format!("display {} is already off", target.describe()));
+    }
     if act.len() <= 1 && act[0].id == target.id {
         fail("refusing to turn off the last active screen");
     }
@@ -99,7 +118,7 @@ fn resolve_on_targets(token: Option<&str>, displays: &[DisplayInfo]) -> Vec<Disp
                 vec![d.clone()]
             } else {
                 // not in the OS list: fine if we disabled it earlier, harmless to try otherwise
-                vec![ghost(t, &state)]
+                vec![ghost(&remembered_id(t, &state), &state)]
             }
         }
     }
@@ -143,6 +162,7 @@ fn print_list(displays: &[DisplayInfo]) {
 fn run_enable(enabled: bool, targets: &[DisplayInfo], explicit: bool) {
     let mut state = common::load_state();
     let mut errors = 0;
+    let mut changed = 0;
     for t in targets {
         // Windows drivers may accept detaching the primary display but refuse
         // the re-attach afterwards (DISP_CHANGE_FAILED), leaving it dark until
@@ -163,6 +183,7 @@ fn run_enable(enabled: bool, targets: &[DisplayInfo], explicit: bool) {
                 } else {
                     state.insert(t.id.clone(), t.name.clone());
                 }
+                changed += 1;
                 let verb = if enabled { "enabled" } else { "disabled" };
                 println!("{verb}  {}", t.describe());
             }
@@ -182,7 +203,7 @@ fn run_enable(enabled: bool, targets: &[DisplayInfo], explicit: bool) {
     }
     common::save_state(&state);
     let now_active = active(&platform::list()).len();
-    println!("- {now_active} display{} active now ({} changed)", if now_active == 1 { "" } else { "s" }, targets.len() - errors);
+    println!("- {now_active} display{} active now ({} changed)", if now_active == 1 { "" } else { "s" }, changed);
     if errors > 0 {
         std::process::exit(1);
     }
@@ -217,7 +238,8 @@ fn main() {
         }
         "on" => {
             let targets = resolve_on_targets(token, &displays);
-            run_enable(true, &targets, token.is_some());
+            // `on all` is the same bulk sweep as `all`: phantom outputs are skipped, not errors
+            run_enable(true, &targets, token.is_some_and(|t| t != "all"));
         }
         "all" => {
             let targets = resolve_on_targets(None, &displays);
@@ -236,8 +258,10 @@ fn main() {
                 }
                 Some(d) => run_enable(true, std::slice::from_ref(d), true),
                 None => {
-                    if common::load_state().contains_key(t) {
-                        run_enable(true, &[ghost(t, &common::load_state())], true);
+                    let state = common::load_state();
+                    let id = remembered_id(t, &state);
+                    if state.contains_key(&id) {
+                        run_enable(true, &[ghost(&id, &state)], true);
                     } else {
                         fail(&format!("unknown target '{t}' - use a display id or `main`"));
                     }
@@ -267,8 +291,9 @@ fn main() {
                     state.clear();
                     println!("forgot {n} entr{}", if n == 1 { "y" } else { "ies" });
                 }
-                Some(id) => {
-                    if state.remove(id).is_some() {
+                Some(t) => {
+                    let id = remembered_id(t, &state);
+                    if state.remove(&id).is_some() {
                         println!("forgot {id}");
                     } else {
                         fail(&format!("'{id}' is not in the off-state"));
@@ -278,5 +303,23 @@ fn main() {
             common::save_state(&state);
         }
         other => fail(&format!("unknown command '{other}' (try `monctl help`)")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::id_matches;
+
+    #[test]
+    fn id_matching_is_whole_name() {
+        assert!(id_matches("\\\\.\\DISPLAY2", "\\\\.\\DISPLAY2"));
+        assert!(id_matches("\\\\.\\DISPLAY2", "DISPLAY2"));
+        assert!(id_matches("\\\\.\\DISPLAY2", "display2"));
+        assert!(id_matches("\\\\.\\DISPLAY2", "2"));
+        assert!(!id_matches("\\\\.\\DISPLAY11", "1"));
+        assert!(!id_matches("\\\\.\\DISPLAY12", "2"));
+        assert!(id_matches("5", "5"));
+        assert!(!id_matches("15", "5"));
+        assert!(id_matches("DP-1", "dp-1"));
     }
 }

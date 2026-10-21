@@ -49,18 +49,20 @@ fn xrandr_list() -> Result<Vec<DisplayInfo>, String> {
         }
         let rest: Vec<&str> = parts.collect();
         let main = rest.first() == Some(&"primary");
-        let active = status == "connected";
-        let detail = rest
-            .iter()
-            .find(|t| t.contains('x') && t.contains('+'))
-            .map(|g| g.to_string())
-            .unwrap_or_else(|| "n/a".into());
+        // "connected" only means a cable is in: an output switched off with
+        // `xrandr --off` is still "connected", just without a WxH+X+Y geometry.
+        let geometry = rest.iter().find(|t| t.contains('x') && t.contains('+')).map(|g| g.to_string());
+        let active = geometry.is_some();
+        // nothing plugged in and nothing configured: an empty connector, not a display
+        if status == "disconnected" && !active {
+            continue;
+        }
         displays.push(DisplayInfo {
             id: name.to_string(),
             active,
             main,
             name: name.to_string(),
-            detail: if active { detail } else { "n/a".into() },
+            detail: geometry.unwrap_or_else(|| "n/a".into()),
         });
     }
     if displays.is_empty() {
@@ -71,10 +73,31 @@ fn xrandr_list() -> Result<Vec<DisplayInfo>, String> {
 
 // ---- KDE Wayland / kscreen-doctor ----
 
+/// kscreen-doctor colours its output even when piped ("\x1b[01;32mOutput: ...").
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // CSI: ESC [ params... final byte in @..~
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn kscreen_list() -> Result<Vec<DisplayInfo>, String> {
     let out = run("kscreen-doctor", &["-o"])?;
     let mut displays = vec![];
-    for line in out.lines() {
+    for line in strip_ansi(&out).lines() {
         let t: Vec<&str> = line.split_whitespace().collect();
         if t.first() != Some(&"Output:") || t.len() < 4 {
             continue;
@@ -82,6 +105,9 @@ fn kscreen_list() -> Result<Vec<DisplayInfo>, String> {
         let id = t[2].to_string(); // connector name, e.g. DP-1
         let enabled = t.iter().any(|&s| s == "enabled");
         let connected = t.iter().any(|&s| s == "connected");
+        if !connected {
+            continue; // empty connector
+        }
         let priority = t.iter().position(|&s| s == "priority").and_then(|i| t.get(i + 1).copied());
         let main = priority == Some("1");
         displays.push(DisplayInfo {
@@ -123,5 +149,13 @@ pub fn set_enabled(id: &str, enable: bool) -> Result<(), String> {
                 run("xrandr", &["--output", id, "--off"]).map(|_| ())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn strip_ansi_removes_csi() {
+        assert_eq!(super::strip_ansi("\x1b[01;32mOutput: \x1b[0;0m1 DP-1 enabled"), "Output: 1 DP-1 enabled");
     }
 }
