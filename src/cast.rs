@@ -737,7 +737,7 @@ fn handle(mut sock: TcpStream, opts: &Options) {
         // nothing past the headers can be buffered yet: the page only talks
         // after it has seen our 101
         drop(reader);
-        if let Err(e) = spawn_worker(&sock, &opts) {
+        if let Err(e) = spawn_worker(&sock, opts) {
             eprintln!("monctl cast: cannot start a session: {e}");
         }
     } else if path == "/" || path.starts_with("/?") || path == "/index.html" {
@@ -1011,6 +1011,18 @@ pub fn run(args: &[String]) -> ! {
     }
     if worker {
         use std::os::fd::FromRawFd;
+        // stopping `monctl cast` (Ctrl+C, the tray's "stop") must take every
+        // tablet screen with it: a worker whose server is gone ends itself
+        extern "C" {
+            fn getppid() -> i32;
+        }
+        let parent = unsafe { getppid() };
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if unsafe { getppid() } != parent {
+                std::process::exit(0);
+            }
+        });
         session(unsafe { TcpStream::from_raw_fd(3) }, &opts);
         std::process::exit(0);
     }

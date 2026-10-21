@@ -254,7 +254,7 @@ pub fn encode(text: &str) -> Option<Vec<Vec<bool>>> {
     }
     let room = capacity * 8 - bits.len();
     bits.extend(std::iter::repeat_n(false, room.min(4)));
-    while bits.len() % 8 != 0 {
+    while !bits.len().is_multiple_of(8) {
         bits.push(false);
     }
     let mut data: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b as u8)).collect();

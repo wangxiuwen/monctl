@@ -281,6 +281,10 @@ fn online_ids() -> Vec<u32> {
 
 /// Create the display in this process. It exists as long as the returned
 /// object does (`release`) - or until the process ends.
+///
+/// # Safety
+/// Calls private CoreGraphics classes through the Objective-C runtime; the
+/// returned object must only be passed to `release`, once.
 pub unsafe fn create(spec: &Spec, serial: u32, name: &str) -> Result<(Id, u32), String> {
     for c in ["CGVirtualDisplay", "CGVirtualDisplayDescriptor", "CGVirtualDisplaySettings", "CGVirtualDisplayMode"] {
         if class(c).is_null() {
@@ -331,6 +335,9 @@ pub unsafe fn create(spec: &Spec, serial: u32, name: &str) -> Result<(Id, u32), 
 }
 
 /// Destroy a display made by `create` in this process.
+///
+/// # Safety
+/// `display` must come from `create` and not have been released yet.
 pub unsafe fn release(display: Id) {
     send(display, "release");
 }

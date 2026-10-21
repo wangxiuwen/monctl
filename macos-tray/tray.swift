@@ -217,7 +217,7 @@ private func enableAllDisplaysCore() {
 
 private func installRecoveryHotkey() {
     var hotKeyRef: EventHotKeyRef?
-    var hotKeyID = EventHotKeyID(signature: OSType(0x6D6F_6E63) /* "monc" */, id: 1)
+    let hotKeyID = EventHotKeyID(signature: OSType(0x6D6F_6E63) /* "monc" */, id: 1)
     var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
     let callback: EventHandlerUPP = { _, event, _ -> OSStatus in
         var id = EventHotKeyID()
@@ -233,11 +233,187 @@ private func installRecoveryHotkey() {
     RegisterEventHotKey(2, UInt32(controlKey | optionKey | shiftKey), hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
 }
 
+// MARK: - resolutions (native: includes the HiDPI modes System Settings hides)
+
+private struct ModeChoice {
+    let mode: CGDisplayMode
+    let title: String
+    let current: Bool
+}
+
+private func modeChoices(_ id: CGDirectDisplayID) -> [ModeChoice] {
+    let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+    guard let all = CGDisplayCopyAllDisplayModes(id, opts) as? [CGDisplayMode] else { return [] }
+    let cur = CGDisplayCopyDisplayMode(id)
+    var seen = Set<String>()
+    var out: [ModeChoice] = []
+    let sorted = all.filter { $0.isUsableForDesktopGUI() }.sorted {
+        ($0.width, $0.height, $0.pixelWidth, $0.refreshRate) > ($1.width, $1.height, $1.pixelWidth, $1.refreshRate)
+    }
+    for m in sorted {
+        let hidpi = m.pixelWidth > m.width
+        let hz = Int(m.refreshRate.rounded())
+        let key = "\(m.width)x\(m.height)-\(hidpi)-\(hz)"
+        if seen.contains(key) { continue }
+        seen.insert(key)
+        let isCur = cur.map { $0.ioDisplayModeID == m.ioDisplayModeID && $0.pixelWidth == m.pixelWidth && $0.width == m.width } ?? false
+        out.append(ModeChoice(mode: m, title: "\(m.width) × \(m.height)\(hz > 0 ? " @\(hz)Hz" : "")\(hidpi ? "  HiDPI" : "")", current: isCur))
+    }
+    return out
+}
+
+private func setMode(_ id: CGDirectDisplayID, _ mode: CGDisplayMode) -> String? {
+    var config: CGDisplayConfigRef?
+    guard CGBeginDisplayConfiguration(&config) == .success, let cfg = config else { return "CGBeginDisplayConfiguration failed" }
+    let err = CGConfigureDisplayWithDisplayMode(cfg, id, mode, nil)
+    guard err == .success else { CGCancelDisplayConfiguration(cfg); return "切换失败：\(err.rawValue)" }
+    return CGCompleteDisplayConfiguration(cfg, .permanently) == .success ? nil : "CGCompleteDisplayConfiguration failed"
+}
+
+// MARK: - monctl CLI (virtual displays, HiDPI, casting live in the CLI)
+
+/// Run the sibling monctl and return (exit code, output). Call off the main thread.
+private func monctlRun(_ args: [String]) -> (Int32, String) {
+    guard let path = monctlPath() else { return (-1, "monctl not found next to the tray app") }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = pipe
+    do { try p.run() } catch { return (-1, error.localizedDescription) }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (p.terminationStatus, String(decoding: data, as: UTF8.self))
+}
+
+private struct VirtualInfo {
+    let id: String
+    let name: String
+}
+
+/// Live virtual displays from `monctl virtual`: lines like `12 "name" (2560x1440 @60Hz, HiDPI)`.
+private func virtualDisplays() -> [VirtualInfo] {
+    let (code, out) = monctlRun(["virtual"])
+    guard code == 0 else { return [] }
+    return out.split(separator: "\n").compactMap { line in
+        let parts = line.split(separator: "\"", omittingEmptySubsequences: false)
+        guard parts.count >= 3, let id = parts[0].split(separator: " ").first else { return nil }
+        return VirtualInfo(id: String(id), name: String(parts[1]))
+    }
+}
+
+// MARK: - tablet casting (`monctl cast` as a child process)
+
+private final class Caster {
+    private(set) var process: Process?
+    private(set) var url: String?
+    private(set) var tablets = 0
+    private var buffer = ""
+    var onChange: () -> Void = {}
+
+    var running: Bool { process?.isRunning ?? false }
+
+    func start() -> String? {
+        guard let path = monctlPath() else { return "找不到 monctl（应与托盘程序放在同一目录）" }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = ["cast"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let chunk = String(decoding: h.availableData, as: UTF8.self)
+            DispatchQueue.main.async { self?.consume(chunk) }
+        }
+        p.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.process = nil
+                self?.url = nil
+                self?.tablets = 0
+                self?.onChange()
+            }
+        }
+        do { try p.run() } catch { return "启动投屏失败：\(error.localizedDescription)" }
+        process = p
+        return nil
+    }
+
+    func stop() {
+        process?.terminate() // workers notice their server is gone and end, taking the tablet screens along
+    }
+
+    private func consume(_ chunk: String) {
+        buffer += chunk
+        while let nl = buffer.firstIndex(of: "\n") {
+            let line = String(buffer[..<nl])
+            buffer.removeSubrange(...nl)
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if url == nil, t.hasPrefix("http://") { url = t }
+            if line.hasPrefix("+ ") { tablets += 1 }
+            if line.hasPrefix("- "), tablets > 0 { tablets -= 1 }
+        }
+        onChange()
+    }
+}
+
+/// Floating panel with the QR code the tablet camera opens directly.
+private final class QRPanel {
+    private var panel: NSPanel?
+
+    func show(url: String) {
+        let size: CGFloat = 260
+        let p = panel ?? NSPanel(contentRect: NSRect(x: 0, y: 0, width: size + 40, height: size + 110),
+                                 styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
+        p.title = "投屏到平板"
+        p.isFloatingPanel = true
+        p.hidesOnDeactivate = false
+        let view = NSView(frame: p.contentRect(forFrameRect: p.frame))
+        let image = NSImageView(frame: NSRect(x: 20, y: 90, width: size, height: size))
+        image.image = qrImage(url, size: size)
+        image.imageScaling = .scaleNone
+        view.addSubview(image)
+        let label = NSTextField(wrappingLabelWithString: "\(url)\n用平板相机扫码，或在浏览器打开。\n安卓平板插 USB 线（已开 USB 调试）会自动打开。")
+        label.frame = NSRect(x: 20, y: 12, width: size, height: 72)
+        label.alignment = .center
+        label.isSelectable = true
+        view.addSubview(label)
+        p.contentView = view
+        p.center()
+        panel = p
+        NSApp.activate(ignoringOtherApps: true)
+        p.makeKeyAndOrderFront(nil)
+    }
+
+    func close() { panel?.orderOut(nil) }
+
+    private func qrImage(_ text: String, size: CGFloat) -> NSImage? {
+        guard let f = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        f.setValue(Data(text.utf8), forKey: "inputMessage")
+        f.setValue("M", forKey: "inputCorrectionLevel")
+        guard let ci = f.outputImage else { return nil }
+        let scale = floor(size / ci.extent.width)
+        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) // nearest: crisp modules
+        let rep = NSCIImageRep(ciImage: scaled)
+        let img = NSImage(size: rep.size)
+        img.addRepresentation(rep)
+        return img
+    }
+}
+
 // MARK: - menu bar UI
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let menu = NSMenu()
+    private let caster = Caster()
+    private let qr = QRPanel()
+    private var virtuals: [VirtualInfo] = []
+    private var shownQRFor: String?
+
+    func applicationWillTerminate(_ notification: Notification) {
+        caster.stop()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let button = statusItem.button {
@@ -247,11 +423,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.autoenablesItems = false
         menu.delegate = self
         statusItem.menu = menu
+        caster.onChange = { [weak self] in
+            guard let self else { return }
+            // pop the QR code up as soon as the server prints its address
+            if let url = self.caster.url, self.shownQRFor != url {
+                self.shownQRFor = url
+                self.qr.show(url: url)
+            }
+            if !self.caster.running { self.shownQRFor = nil; self.qr.close() }
+            self.rebuildMenu()
+        }
+        refreshVirtuals()
         rebuildMenu()
         installRecoveryHotkey()
     }
 
-    func menuNeedsUpdate(_ menu: NSMenu) { rebuildMenu() }
+    /// `monctl virtual` spawns a process: keep it off the menu-opening path.
+    private func refreshVirtuals() {
+        DispatchQueue.global().async {
+            let v = virtualDisplays()
+            DispatchQueue.main.async { self.virtuals = v; self.rebuildMenu() }
+        }
+    }
+
+    /// Run monctl in the background, alert on failure, then refresh.
+    private func monctlAsync(_ args: [String]) {
+        DispatchQueue.global().async {
+            let (code, out) = monctlRun(args)
+            let v = virtualDisplays()
+            DispatchQueue.main.async {
+                self.virtuals = v
+                if code != 0 { self.alert(out.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                self.rebuildMenu()
+            }
+        }
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildMenu()
+        refreshVirtuals()
+    }
 
     private func addItem(_ title: String, action: Selector, target: AnyObject? = nil, enabled: Bool = true, id: CGDirectDisplayID? = nil) {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
@@ -286,6 +497,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         addItem("只留主屏", action: #selector(soloMain), target: self, enabled: activeCount > 1)
         addItem("全部开启 ⌃⌥⇧D", action: #selector(allOn), target: self, enabled: activeCount < displays.count || !remembered.isEmpty)
+        menu.addItem(.separator())
+        addDisplayTools(displays.filter(\.active))
         menu.addItem(.separator())
         if let monctl = monctlPath() {
             let (remaining, displayHold) = awakeState()
@@ -325,6 +538,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         autoStart.state = agentInstalled() ? .on : .off
         menu.addItem(autoStart)
         addItem("退出", action: #selector(NSApplication.terminate(_:)))
+    }
+
+    private func submenuItem(_ title: String, _ sub: NSMenu) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        it.submenu = sub
+        return it
+    }
+
+    private func subItem(_ sub: NSMenu, _ title: String, _ action: Selector, _ obj: Any? = nil, checked: Bool = false, enabled: Bool = true) {
+        let it = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        it.target = self
+        it.representedObject = obj
+        it.state = checked ? .on : .off
+        it.isEnabled = enabled
+        sub.addItem(it)
+    }
+
+    /// 分辨率 / HiDPI / 虚拟显示器 / 投屏到平板
+    private func addDisplayTools(_ active: [DisplayInfo]) {
+        // resolutions: one submenu per display (flat when there is just one)
+        let res = NSMenu()
+        for d in active {
+            let target: NSMenu
+            if active.count == 1 {
+                target = res
+            } else {
+                target = NSMenu()
+                res.addItem(submenuItem(d.name, target))
+            }
+            for c in modeChoices(d.id).prefix(40) {
+                subItem(target, c.title, #selector(pickMode(_:)), [NSNumber(value: d.id), c.mode] as NSArray, checked: c.current)
+            }
+        }
+        menu.addItem(submenuItem("分辨率", res))
+
+        // HiDPI on real screens (macOS refuses it on most non-Retina monitors)
+        let hidpi = NSMenu()
+        let hidpiOn = Set(virtuals.compactMap { $0.name.hasPrefix("HiDPI ") ? String($0.name.dropFirst(6)) : nil })
+        // monctl's own virtual screens (vendor "mn", product "vc" - see src/virt.rs)
+        // are canvases already, HiDPI on them makes no sense
+        for d in active where !(CGDisplayVendorNumber(d.id) == 0x6d6e && CGDisplayModelNumber(d.id) == 0x7663) {
+            subItem(hidpi, d.name, #selector(toggleHiDPI(_:)), String(d.id), checked: hidpiOn.contains(String(d.id)))
+        }
+        if hidpi.items.isEmpty { subItem(hidpi, "没有可用的屏幕", #selector(noop), enabled: false) }
+        menu.addItem(submenuItem("HiDPI 清晰模式", hidpi))
+
+        // virtual displays
+        let virt = NSMenu()
+        for (label, size) in [("新建 1920 × 1080", "1920x1080"), ("新建 2560 × 1440", "2560x1440"), ("新建 3840 × 2160 (4K)", "3840x2160")] {
+            subItem(virt, label, #selector(addVirtual(_:)), size)
+        }
+        let mine = virtuals.filter { !$0.name.hasPrefix("HiDPI ") }
+        if !mine.isEmpty {
+            virt.addItem(.separator())
+            for v in mine { subItem(virt, "移除 \(v.name)", #selector(removeVirtual(_:)), v.id) }
+            subItem(virt, "全部移除", #selector(removeVirtual(_:)), "all")
+        }
+        menu.addItem(submenuItem("虚拟显示器", virt))
+
+        // tablets
+        if caster.running {
+            let n = caster.tablets
+            addItem(n > 0 ? "停止投屏（已连接 \(n) 台平板）" : "停止投屏（等待平板连接）", action: #selector(toggleCast), target: self)
+            addItem("显示投屏二维码…", action: #selector(showQR), target: self, enabled: caster.url != nil)
+        } else {
+            addItem("投屏到平板…", action: #selector(toggleCast), target: self)
+        }
+    }
+
+    @objc private func noop() {}
+
+    @objc private func pickMode(_ sender: NSMenuItem) {
+        guard let pair = sender.representedObject as? NSArray, pair.count == 2,
+              let id = (pair[0] as? NSNumber)?.uint32Value else { return }
+        let mode = pair[1] as! CGDisplayMode
+        if let err = setMode(id, mode) { alert(err) }
+        rebuildMenu()
+    }
+
+    @objc private func toggleHiDPI(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        monctlAsync(sender.state == .on ? ["hidpi", "off", id] : ["hidpi", id])
+    }
+
+    @objc private func addVirtual(_ sender: NSMenuItem) {
+        guard let size = sender.representedObject as? String else { return }
+        monctlAsync(["virtual", "add", size])
+    }
+
+    @objc private func removeVirtual(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        monctlAsync(["virtual", "rm", id])
+    }
+
+    @objc private func toggleCast() {
+        if caster.running {
+            caster.stop()
+        } else if let err = caster.start() {
+            alert(err)
+        }
+        rebuildMenu()
+    }
+
+    @objc private func showQR() {
+        if let url = caster.url { qr.show(url: url) }
     }
 
     @objc private func toggleItem(_ sender: NSMenuItem) {
