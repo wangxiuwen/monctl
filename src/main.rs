@@ -91,10 +91,14 @@ fn resolve_on_targets(token: Option<&str>, displays: &[DisplayInfo]) -> Vec<Disp
             // phantom outputs (virtual adapters with no panel) can never be
             // re-attached; don't report them as errors every time
             #[cfg(windows)]
-            ids.retain(|id| match displays.iter().find(|d| d.id == *id) {
-                Some(_) => monctl::windows::can_attach(id),
-                None => true, // remembered-off ghost: a real display we turned off
-            });
+            {
+                // the virtual display driver's parked monitor belongs to `cast`
+                let vdd = monctl::windows::adapters_named(monctl::winvdd::ADAPTER_NAME, false);
+                ids.retain(|id| match displays.iter().find(|d| d.id == *id) {
+                    Some(_) => monctl::windows::can_attach(id) && !vdd.contains(id),
+                    None => true, // remembered-off ghost: a real display we turned off
+                });
+            }
             if ids.is_empty() {
                 fail("nothing to enable - every connected display is already on");
             }
@@ -372,10 +376,10 @@ fn main() {
         "sleep" => awake::sleep_now(),
         #[cfg(target_os = "macos")]
         "virtual" | "virt" => monctl::virt::run(&args[1..]),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         "cast" | "tablet" => monctl::cast::run(&args[1..]),
-        #[cfg(not(target_os = "macos"))]
-        "cast" | "tablet" => fail("casting to a tablet is macOS-only for now"),
+        #[cfg(not(any(target_os = "macos", windows)))]
+        "cast" | "tablet" => fail("casting to a tablet needs macOS or Windows for now"),
         #[cfg(windows)]
         "driver" => monctl::winvdd::run_cli(&args[1..]),
         #[cfg(not(target_os = "macos"))]

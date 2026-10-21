@@ -2,7 +2,7 @@
 // (src/bin/monctl-tray.rs).
 
 pub mod awake;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub mod cast;
 pub mod common;
 #[cfg(target_os = "linux")]

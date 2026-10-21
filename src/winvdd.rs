@@ -8,9 +8,14 @@
 // prompt) puts them in place - users never fetch or install a driver
 // themselves.
 //
-// VDD is driven by a settings file (monitor count + allowed resolutions) and
-// a named pipe; changing the count reloads the driver. Its settings live in
-// monctl's own directory (VDDPATH), not shared with other VDD installs.
+// VDD is configured by a settings file (monitor count + offered
+// resolutions) read when the device starts. Its runtime "reload" is not
+// safe to use (SETDISPLAYCOUNT never answers on the pipe and its reload
+// path crashes the device when a monitor is detached - problem code 43), so
+// monctl never reloads: the device starts with a fixed pool of monitors
+// offering the usual tablet resolutions, all kept off the desktop ("parked")
+// until a tablet claims one. Settings live in monctl's own directory
+// (VDDPATH), not shared with other VDD installs.
 
 use crate::common::fail;
 use std::ffi::c_void;
@@ -25,6 +30,24 @@ const HARDWARE_ID: &str = "Root\\MttVDD";
 /// Adapter description VDD's monitors hang off (EnumDisplayDevices DeviceString).
 pub const ADAPTER_NAME: &str = "Virtual Display Driver";
 const PIPE: &str = "\\\\.\\pipe\\MTTVirtualDisplayPipe";
+/// Monitors the device starts with: one per concurrently connected tablet.
+pub const POOL: usize = 4;
+/// The driver builds no monitor at all when offered more than 50 modes
+/// (51 fails, verified on 26200) - so this list is curated, not exhaustive.
+const MAX_MODES: usize = 50;
+/// Physical resolutions of common tablets (landscape; portrait is added too,
+/// so each costs two modes). Tablets not listed get the closest mode of the
+/// same aspect ratio and are learned (`learn_size`) for the next start.
+const TABLET_SIZES: &[(u32, u32)] = &[
+    // iPad: 9th gen, Air / 10th, Pro 11, Pro 11 (M4), Pro 12.9, Pro 13 (M4), mini 6, older 9.7"
+    (2160, 1620), (2360, 1640), (2388, 1668), (2420, 1668), (2732, 2048), (2752, 2064), (2266, 1488), (2048, 1536),
+    // Android: Samsung Tab S (11" / + / Ultra), Xiaomi Pad, the common 16:10 panels
+    (2560, 1600), (2800, 1752), (2960, 1848), (2880, 1800), (1920, 1200), (2000, 1200), (1280, 800),
+    // Surface Pro 8-11, Pro 4-7, Go
+    (2880, 1920), (2736, 1824), (1920, 1280),
+    // plain 1080p
+    (1920, 1080),
+];
 
 type HANDLE = *mut c_void;
 type BOOL = i32;
@@ -76,6 +99,7 @@ extern "system" {
     fn SetupDiSetDeviceRegistryPropertyW(set: HANDLE, data: *mut SP_DEVINFO_DATA, prop: u32, buf: *const u8, size: u32) -> BOOL;
     fn SetupDiGetDeviceRegistryPropertyW(set: HANDLE, data: *mut SP_DEVINFO_DATA, prop: u32, kind: *mut u32, buf: *mut u8, size: u32, needed: *mut u32) -> BOOL;
     fn SetupDiCallClassInstaller(dif: u32, set: HANDLE, data: *mut SP_DEVINFO_DATA) -> BOOL;
+    fn SetupDiSetClassInstallParamsW(set: HANDLE, data: *mut SP_DEVINFO_DATA, params: *const c_void, size: u32) -> BOOL;
     fn SetupDiDestroyDeviceInfoList(set: HANDLE) -> BOOL;
 }
 
@@ -154,6 +178,41 @@ fn for_each_vdd_device(mut f: impl FnMut(HANDLE, &mut SP_DEVINFO_DATA)) {
     }
 }
 
+/// Restart the device (after the driver crashed: problem code 43). Admin.
+pub fn restart() -> Result<(), String> {
+    #[repr(C)]
+    struct PropChangeParams {
+        cb_size: u32,
+        install_function: u32,
+        state_change: u32,
+        scope: u32,
+        hw_profile: u32,
+    }
+    const DIF_PROPERTYCHANGE: u32 = 0x12;
+    const DICS_PROPCHANGE: u32 = 3;
+    const DICS_FLAG_GLOBAL: u32 = 1;
+    if !is_admin() {
+        return Err("restarting a driver needs administrator rights".into());
+    }
+    let mut result = Err("the virtual display driver is not installed".to_string());
+    for_each_vdd_device(|set, data| unsafe {
+        let params = PropChangeParams { cb_size: 8, install_function: DIF_PROPERTYCHANGE, state_change: DICS_PROPCHANGE, scope: DICS_FLAG_GLOBAL, hw_profile: 0 };
+        let ok = SetupDiSetClassInstallParamsW(set, data, &params as *const PropChangeParams as *const c_void, std::mem::size_of::<PropChangeParams>() as u32) != 0
+            && SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, data) != 0;
+        result = if ok { Ok(()) } else { Err(format!("restarting the driver failed ({})", GetLastError())) };
+    });
+    if result.is_ok() {
+        for _ in 0..25 {
+            if pool_ready() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        park();
+    }
+    result
+}
+
 /// Is the VDD device node there (installed by us or anyone)?
 pub fn device_present() -> bool {
     let mut found = false;
@@ -203,7 +262,7 @@ pub fn install() -> Result<(), String> {
     for (name, data) in [("MttVDD.inf", INF), ("MttVDD.dll", DLL), ("mttvdd.cat", CAT), ("signpath-foundation.cer", PUBLISHER_CERT)] {
         std::fs::write(dir.join(name), data).map_err(|e| format!("writing {name}: {e}"))?;
     }
-    write_settings(&[], 0)?;
+    write_settings()?;
     // monctl runs as the user and rewrites the settings when tablets come
     // and go; the directory is created by an admin, so open it up
     run("icacls", &[&dir.to_string_lossy(), "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/Q"])?;
@@ -229,6 +288,14 @@ pub fn install() -> Result<(), String> {
     if unsafe { UpdateDriverForPlugAndPlayDevicesW(std::ptr::null_mut(), hwid.as_ptr(), inf.as_ptr(), INSTALLFLAG_FORCE, &mut reboot) } == 0 {
         return Err(format!("installing the driver failed ({})", unsafe { GetLastError() }));
     }
+    // it comes up with its monitor pool on the desktop: park them
+    for _ in 0..25 {
+        if crate::windows::adapters_named(ADAPTER_NAME, false).len() >= POOL {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    park();
     // tablets reach the cast server over the LAN
     if let Ok(exe) = std::env::current_exe() {
         let program = format!("program={}", exe.display());
@@ -283,13 +350,24 @@ fn run(program: &str, args: &[&str]) -> Result<(), String> {
 /// Make sure the driver is there, asking for elevation once if it isn't:
 /// re-runs `monctl driver install` elevated (the UAC prompt) and waits.
 pub fn ensure() -> Result<(), String> {
-    if device_present() && ping() {
+    if device_present() && ping() && pool_ready() {
         return Ok(());
     }
-    if is_admin() {
-        return install();
+    // installed but stopped (crashed: Windows parks it at problem 43), or
+    // started with older settings (no pool yet): restart with ours
+    let action = if device_present() { "restart" } else { "install" };
+    if action == "restart" {
+        write_settings()?;
     }
-    elevate(&["driver", "install"])?;
+    if is_admin() {
+        if action == "restart" {
+            restart()?;
+        } else {
+            install()?;
+        }
+    } else {
+        elevate(&["driver", action])?;
+    }
     // the driver service needs a moment after binding
     for _ in 0..50 {
         if ping() {
@@ -362,8 +440,18 @@ fn elevate(args: &[&str]) -> Result<(), String> {
 
 // ---------------------------------------------------------- pipe control ----
 
-/// Send one command to the driver; returns its reply.
+/// Send one command to the driver; returns its reply. Bounded: some commands
+/// never answer and a wedged driver must not hang the caller.
 fn pipe(cmd: &str) -> Result<String, String> {
+    let cmd = cmd.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(pipe_blocking(&cmd));
+    });
+    rx.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| Err("the virtual display driver does not respond".into()))
+}
+
+fn pipe_blocking(cmd: &str) -> Result<String, String> {
     const GENERIC_RW: u32 = 0x8000_0000 | 0x4000_0000;
     const OPEN_EXISTING: u32 = 3;
     const PIPE_READMODE_MESSAGE: u32 = 2;
@@ -403,23 +491,55 @@ pub fn ping() -> bool {
     pipe("PING").is_ok()
 }
 
-/// Write the settings: `count` monitors, offering `sizes` (plus a few common
-/// ones so a monitor is usable before it is resized) at 60 Hz.
-fn write_settings(sizes: &[(u32, u32)], count: usize) -> Result<(), String> {
-    let mut all: Vec<(u32, u32)> = sizes.to_vec();
-    all.extend([(1920, 1080), (2560, 1440), (1280, 800), (2048, 1536)]);
-    all.dedup();
-    let mut seen = vec![];
-    let mut res = String::new();
-    for (w, h) in all {
-        if seen.contains(&(w, h)) {
-            continue;
-        }
-        seen.push((w, h));
-        res.push_str(&format!("        <resolution><width>{w}</width><height>{h}</height><refresh_rate>60</refresh_rate></resolution>\n"));
+/// Sizes seen from tablets that weren't in TABLET_SIZES: offered from the
+/// next device start on (reboot / reinstall), so that tablet gets its exact
+/// size; until then it gets the closest one.
+fn learned_path() -> PathBuf {
+    home().join("learned_sizes.txt")
+}
+
+fn learned_sizes() -> Vec<(u32, u32)> {
+    std::fs::read_to_string(learned_path())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('x').and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?))))
+        .collect()
+}
+
+pub fn learn_size(w: u32, h: u32) {
+    let mut known = learned_sizes();
+    let (w, h) = (w.max(h), w.min(h)); // stored landscape; both orientations are offered
+    if known.contains(&(w, h)) || TABLET_SIZES.contains(&(w, h)) {
+        return;
     }
+    known.push((w, h));
+    // stay under the driver's mode limit: the oldest learned sizes go first
+    let room = (MAX_MODES - TABLET_SIZES.len() * 2) / 2;
+    while known.len() > room {
+        known.remove(0);
+    }
+    let text: String = known.iter().map(|(w, h)| format!("{w}x{h}\n")).collect();
+    let _ = std::fs::write(learned_path(), text);
+    let _ = write_settings();
+}
+
+/// The settings the device reads when it starts: the monitor pool, every
+/// tablet size in both orientations, 60 Hz.
+fn write_settings() -> Result<(), String> {
+    let mut sizes: Vec<(u32, u32)> = vec![];
+    for &(w, h) in TABLET_SIZES.iter().chain(learned_sizes().iter()) {
+        for s in [(w, h), (h, w)] {
+            if !sizes.contains(&s) {
+                sizes.push(s);
+            }
+        }
+    }
+    let res: String = sizes
+        .iter()
+        .map(|(w, h)| format!("        <resolution><width>{w}</width><height>{h}</height><refresh_rate>60</refresh_rate></resolution>\n"))
+        .collect();
     let xml = format!(
-        "<?xml version='1.0' encoding='utf-8'?>\n<!-- written by monctl: tablet screens come and go with the cast server -->\n<vdd_settings>\n    <monitors><count>{count}</count></monitors>\n    <gpu><friendlyname>default</friendlyname></gpu>\n    <global><g_refresh_rate>60</g_refresh_rate></global>\n    <resolutions>\n{res}    </resolutions>\n    <options>\n        <CustomEdid>false</CustomEdid>\n        <PreventSpoof>false</PreventSpoof>\n        <EdidCeaOverride>false</EdidCeaOverride>\n        <HardwareCursor>false</HardwareCursor>\n        <SDR10bit>false</SDR10bit>\n        <HDRPlus>false</HDRPlus>\n        <logging>false</logging>\n        <debuglogging>false</debuglogging>\n    </options>\n</vdd_settings>\n"
+        "<?xml version='1.0' encoding='utf-8'?>\n<!-- written by monctl: a pool of tablet screens, parked until a tablet claims one -->\n<vdd_settings>\n    <monitors><count>{POOL}</count></monitors>\n    <gpu><friendlyname>default</friendlyname></gpu>\n    <global><g_refresh_rate>60</g_refresh_rate></global>\n    <resolutions>\n{res}    </resolutions>\n    <options>\n        <CustomEdid>false</CustomEdid>\n        <PreventSpoof>false</PreventSpoof>\n        <EdidCeaOverride>false</EdidCeaOverride>\n        <HardwareCursor>false</HardwareCursor>\n        <SDR10bit>false</SDR10bit>\n        <HDRPlus>false</HDRPlus>\n        <logging>false</logging>\n        <debuglogging>false</debuglogging>\n    </options>\n</vdd_settings>\n"
     );
     let path = home().join("vdd_settings.xml");
     std::fs::write(&path, xml).map_err(|e| format!("{}: {e}", path.display()))
@@ -427,29 +547,55 @@ fn write_settings(sizes: &[(u32, u32)], count: usize) -> Result<(), String> {
 
 /// `\\.\DISPLAYn` names of the driver's monitors that are on the desktop.
 pub fn displays() -> Vec<String> {
-    crate::windows::adapters_named(ADAPTER_NAME)
+    crate::windows::adapters_named(ADAPTER_NAME, true)
 }
 
-/// Show exactly `sizes.len()` virtual monitors offering those sizes. The
-/// driver reloads (every VDD monitor is recreated); returns the new monitor
-/// names, in creation order.
-pub fn set_monitors(sizes: &[(u32, u32)]) -> Result<Vec<String>, String> {
-    write_settings(sizes, sizes.len())?;
-    pipe(&format!("SETDISPLAYCOUNT {}", sizes.len()))?;
-    // wait for the reload to settle on the new count
-    let mut last = vec![];
-    for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(200));
-        let now = displays();
-        if now.len() == sizes.len() && now == last {
-            return Ok(now);
-        }
-        last = now;
+/// Keep every monitor of the pool off the desktop (like `monctl off` does
+/// for a real screen) so windows never wander onto a screen nobody sees.
+/// Needs no admin rights.
+pub fn park() {
+    for d in displays() {
+        let _ = crate::windows::set_enabled(&d, false);
     }
-    if sizes.is_empty() {
-        return Ok(vec![]);
+}
+
+/// All monitors of the pool, parked or not, in a stable order.
+pub fn pool() -> Vec<String> {
+    crate::windows::adapters_named(ADAPTER_NAME, false)
+}
+
+/// Put pool monitor `name` on the desktop at `w`x`h` (or the closest offered
+/// size of the same orientation). Returns the size it got.
+pub fn claim(name: &str, w: u32, h: u32) -> Result<(u32, u32), String> {
+    if !displays().iter().any(|d| d == name) {
+        crate::windows::set_enabled(name, true)?;
     }
-    Err(format!("expected {} virtual display(s), the driver shows {}", sizes.len(), last.len()))
+    let modes = crate::windows::modes(name)?;
+    let portrait = h > w;
+    let best = modes
+        .iter()
+        .filter(|m| m.hz == 0 || m.hz >= 59)
+        .filter(|m| (m.height > m.width) == portrait)
+        .min_by_key(|m| {
+            // exact first, then the same aspect ratio, then the closest area
+            let aspect = ((m.width as f64 / m.height as f64) - (w as f64 / h as f64)).abs();
+            ((aspect * 1000.0) as i64, ((m.width * m.height) as i64 - (w * h) as i64).abs())
+        })
+        .cloned()
+        .ok_or_else(|| format!("{name} offers no usable mode"))?;
+    if (best.width, best.height) != (w, h) {
+        learn_size(w, h);
+    }
+    if !best.current {
+        crate::windows::set_mode(name, &best)?;
+    }
+    Ok((best.width, best.height))
+}
+
+/// Is the running device configured as monctl's pool? (An older install, or
+/// one whose settings changed, needs a device restart to pick them up.)
+pub fn pool_ready() -> bool {
+    pool().len() >= POOL
 }
 
 // ----------------------------------------------------------------- CLI ----
@@ -458,6 +604,10 @@ pub fn run_cli(args: &[String]) -> ! {
     match args.first().map(|s| s.as_str()) {
         Some("install") => match install() {
             Ok(()) => println!("virtual display driver installed ({})", home().display()),
+            Err(e) => fail(&e),
+        },
+        Some("restart") => match restart() {
+            Ok(()) => println!("virtual display driver restarted"),
             Err(e) => fail(&e),
         },
         Some("uninstall" | "remove") => match uninstall() {
@@ -475,19 +625,38 @@ pub fn run_cli(args: &[String]) -> ! {
                     (true, true) => "installed and running",
                 }
             );
-            for d in displays() {
-                println!("  {d}");
+            let on = displays();
+            for d in pool() {
+                println!("  {d}  {}", if on.contains(&d) { "on the desktop" } else { "parked" });
             }
         }
-        Some("count") => {
-            let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or_else(|| fail("usage: monctl driver count N"));
-            let sizes = vec![(1920, 1080); n];
-            match ensure().and_then(|()| set_monitors(&sizes)) {
-                Ok(d) => println!("{} virtual display(s): {}", d.len(), d.join(" ")),
+        Some("park") => {
+            park();
+            println!("virtual display parked");
+        }
+        Some("claim") => {
+            let (w, h) = args.get(1).and_then(|s| s.split_once('x')).and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))).unwrap_or((1920, 1080));
+            let Some(name) = pool().into_iter().next() else { fail("the virtual display driver has no monitors (monctl driver restart)") };
+            match claim(&name, w, h) {
+                Ok((gw, gh)) => println!("{name} on the desktop at {gw}x{gh} (monctl driver park removes it)"),
                 Err(e) => fail(&e),
             }
         }
-        _ => fail("usage: monctl driver [status|install|uninstall|count N]"),
+        _ => fail("usage: monctl driver [status|install|uninstall|restart|claim WxH|park]"),
     }
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tablet_sizes_fit_the_driver_mode_limit() {
+        let modes = super::TABLET_SIZES.len() * 2;
+        assert!(modes <= super::MAX_MODES - 8, "{modes} modes leave no room to learn sizes");
+        let mut seen = std::collections::BTreeSet::new();
+        for &(w, h) in super::TABLET_SIZES {
+            assert!(w > h && w % 2 == 0 && h % 2 == 0, "{w}x{h}: landscape, even sizes only");
+            assert!(seen.insert((w, h)), "{w}x{h} listed twice");
+        }
+    }
 }

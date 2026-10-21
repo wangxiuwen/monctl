@@ -45,6 +45,9 @@ pub(crate) struct Hello {
     pub width: u32,
     pub height: u32,
     pub dpr: f64,
+    /// stable per tablet (localStorage): macOS keys the virtual display's
+    /// identity on it; the Windows driver has no per-monitor identity
+    #[cfg_attr(windows, allow(dead_code))]
     pub client: String,
     pub label: String,
 }

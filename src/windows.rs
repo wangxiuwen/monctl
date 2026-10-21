@@ -166,14 +166,22 @@ fn adapters() -> Vec<(String, String, DWORD)> {
     out
 }
 
-/// `\\.\DISPLAYn` of the desktop-attached outputs of adapters described as
-/// `name` (e.g. a virtual display driver's), in enumeration order.
-pub fn adapters_named(name: &str) -> Vec<String> {
+/// `\\.\DISPLAYn` of the outputs of adapters described as `name` (e.g. a
+/// virtual display driver's), in enumeration order; `attached` = only those
+/// on the desktop. (A detached virtual output has no monitor child at all.)
+pub fn adapters_named(name: &str, attached: bool) -> Vec<String> {
     adapters()
         .into_iter()
-        .filter(|(_, desc, flags)| desc == name && flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0)
+        .filter(|(_, desc, flags)| desc == name && (!attached || flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0))
         .map(|(dev, _, _)| dev)
         .collect()
+}
+
+/// Desktop rectangle (x, y, width, height) of an active display, in pixels.
+pub fn bounds(device: &str) -> Option<(i32, i32, i32, i32)> {
+    let dm = current_settings(device).filter(|dm| dm.dm_pels_width > 0)?;
+    let (x, y) = unsafe { (dm.u.position.x, dm.u.position.y) };
+    Some((x, y, dm.dm_pels_width as i32, dm.dm_pels_height as i32))
 }
 
 fn current_settings(device: &str) -> Option<DEVMODEW> {
@@ -353,13 +361,166 @@ fn best_frequency_at(device: &str, width: DWORD, height: DWORD) -> Option<DWORD>
     best
 }
 
+// ---- CCD (QueryDisplayConfig / SetDisplayConfig) ----
+//
+// The GDI attach path needs a stored mode; an output whose monitor went
+// away while detached (a parked virtual display after a driver restart) has
+// none. CCD can still activate its path: keep every active path, add that
+// one, let Windows pick the mode.
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PathInfo {
+    src_adapter: [u32; 2],
+    src_id: u32,
+    src_mode_idx: u32,
+    src_flags: u32,
+    tgt_adapter: [u32; 2],
+    tgt_id: u32,
+    tgt_mode_idx: u32,
+    tgt_tech: u32,
+    tgt_rotation: u32,
+    tgt_scaling: u32,
+    tgt_refresh: [u32; 2],
+    tgt_scanline: u32,
+    tgt_available: BOOL,
+    tgt_flags: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ModeInfo {
+    info_type: u32,
+    id: u32,
+    adapter: [u32; 2],
+    data: [u32; 12],
+}
+
+#[repr(C)]
+struct SourceName {
+    kind: i32,
+    size: u32,
+    adapter: [u32; 2],
+    id: u32,
+    gdi_name: [WCHAR; 32],
+}
+
+const _: () = assert!(std::mem::size_of::<PathInfo>() == 72 && std::mem::size_of::<ModeInfo>() == 64 && std::mem::size_of::<SourceName>() == 84);
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetDisplayConfigBufferSizes(flags: u32, paths: *mut u32, modes: *mut u32) -> LONG;
+    fn QueryDisplayConfig(flags: u32, np: *mut u32, paths: *mut PathInfo, nm: *mut u32, modes: *mut ModeInfo, topology: *mut c_void) -> LONG;
+    fn SetDisplayConfig(np: u32, paths: *const PathInfo, nm: u32, modes: *const ModeInfo, flags: u32) -> LONG;
+    // one declaration for every packet type: they all start with the header
+    fn DisplayConfigGetDeviceInfo(packet: *mut c_void) -> LONG;
+    fn DisplayConfigSetDeviceInfo(packet: *const c_void) -> LONG;
+}
+
+fn query_config(flags: u32) -> Option<(Vec<PathInfo>, Vec<ModeInfo>)> {
+    unsafe {
+        let (mut np, mut nm) = (0u32, 0u32);
+        if GetDisplayConfigBufferSizes(flags, &mut np, &mut nm) != 0 {
+            return None;
+        }
+        let mut paths = vec![std::mem::zeroed::<PathInfo>(); np as usize];
+        let mut modes = vec![std::mem::zeroed::<ModeInfo>(); nm as usize];
+        if QueryDisplayConfig(flags, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), std::ptr::null_mut()) != 0 {
+            return None;
+        }
+        paths.truncate(np as usize);
+        modes.truncate(nm as usize);
+        Some((paths, modes))
+    }
+}
+
+fn source_gdi_name(p: &PathInfo) -> String {
+    let mut n = SourceName { kind: 1, size: std::mem::size_of::<SourceName>() as u32, adapter: p.src_adapter, id: p.src_id, gdi_name: [0; 32] };
+    if unsafe { DisplayConfigGetDeviceInfo((&mut n as *mut SourceName).cast()) } != 0 {
+        return String::new();
+    }
+    wide_to_string(&n.gdi_name)
+}
+
+/// Per-monitor scaling ("Scale" in Settings → Display): what System Settings
+/// itself uses, DisplayConfigSetDeviceInfo with the undocumented types -3/-4.
+/// Scales are steps relative to the monitor's recommended one.
+pub fn set_scale(id: &str, percent: u32) -> Result<u32, String> {
+    const STEPS: [u32; 12] = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
+    #[repr(C)]
+    struct ScaleGet {
+        kind: i32,
+        size: u32,
+        adapter: [u32; 2],
+        id: u32,
+        min_rel: i32,
+        cur_rel: i32,
+        max_rel: i32,
+    }
+    #[repr(C)]
+    struct ScaleSet {
+        kind: i32,
+        size: u32,
+        adapter: [u32; 2],
+        id: u32,
+        rel: i32,
+    }
+    const QDC_ONLY_ACTIVE_PATHS: u32 = 0x2;
+    let (paths, _) = query_config(QDC_ONLY_ACTIVE_PATHS).ok_or("QueryDisplayConfig failed")?;
+    let p = paths.iter().find(|p| source_gdi_name(p).eq_ignore_ascii_case(id)).ok_or_else(|| format!("{id} is not active"))?;
+    let mut get = ScaleGet { kind: -3, size: std::mem::size_of::<ScaleGet>() as u32, adapter: p.src_adapter, id: p.src_id, min_rel: 0, cur_rel: 0, max_rel: 0 };
+    if unsafe { DisplayConfigGetDeviceInfo((&mut get as *mut ScaleGet).cast()) } != 0 {
+        return Err(format!("reading the scale of {id} failed"));
+    }
+    // the recommended step sits at -min_rel; the target is the nearest step
+    let recommended = get.min_rel.unsigned_abs() as usize;
+    let target = (0..STEPS.len()).min_by_key(|&i| STEPS[i].abs_diff(percent)).unwrap();
+    let rel = (target as i32 - recommended as i32).clamp(get.min_rel, get.max_rel);
+    let set = ScaleSet { kind: -4, size: std::mem::size_of::<ScaleSet>() as u32, adapter: p.src_adapter, id: p.src_id, rel };
+    if unsafe { DisplayConfigSetDeviceInfo((&set as *const ScaleSet).cast()) } != 0 {
+        return Err(format!("setting the scale of {id} failed"));
+    }
+    Ok(STEPS[(recommended as i32 + rel).clamp(0, STEPS.len() as i32 - 1) as usize])
+}
+
+fn enable_via_ccd(id: &str) -> Result<(), String> {
+    const QDC_ALL_PATHS: u32 = 0x1;
+    const QDC_ONLY_ACTIVE_PATHS: u32 = 0x2;
+    const PATH_ACTIVE: u32 = 0x1;
+    const MODE_IDX_INVALID: u32 = 0xFFFF_FFFF;
+    const SDC_APPLY: u32 = 0x80;
+    const SDC_USE_SUPPLIED_DISPLAY_CONFIG: u32 = 0x20;
+    const SDC_SAVE_TO_DATABASE: u32 = 0x200;
+    const SDC_ALLOW_CHANGES: u32 = 0x400;
+    let (mut paths, modes) = query_config(QDC_ONLY_ACTIVE_PATHS).ok_or("QueryDisplayConfig failed")?;
+    let (all, _) = query_config(QDC_ALL_PATHS).ok_or("QueryDisplayConfig failed")?;
+    let mut new = *all
+        .iter()
+        .find(|p| p.tgt_available != 0 && p.flags & PATH_ACTIVE == 0 && source_gdi_name(p).eq_ignore_ascii_case(id))
+        .ok_or_else(|| format!("{id} has no connectable display path"))?;
+    new.flags |= PATH_ACTIVE;
+    new.src_mode_idx = MODE_IDX_INVALID;
+    new.tgt_mode_idx = MODE_IDX_INVALID;
+    paths.push(new);
+    let rc = unsafe { SetDisplayConfig(paths.len() as u32, paths.as_ptr(), modes.len() as u32, modes.as_ptr(), SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE) };
+    if rc != 0 {
+        return Err(format!("SetDisplayConfig returned {rc}"));
+    }
+    Ok(())
+}
+
 pub fn set_enabled(id: &str, enable: bool) -> Result<(), String> {
     check_id(id)?;
     if enable {
         // attach: restore the stored mode (or any real mode), placed to the right of the desktop
         let mut dm = match current_settings(id).filter(|dm| dm.dm_pels_width > 0 && dm.dm_pels_height > 0) {
             Some(dm) => dm,
-            None => any_real_mode(id).ok_or_else(|| format!("no usable stored mode for {id} — cannot re-attach it"))?,
+            None => match any_real_mode(id) {
+                Some(dm) => dm,
+                // no stored mode (its monitor went away while detached): CCD can still do it
+                None => return enable_via_ccd(id).map_err(|e| format!("cannot re-attach {id}: {e}")),
+            },
         };
         // never re-attach below what the panel advertises at this resolution
         if let Some(hz) = best_frequency_at(id, dm.dm_pels_width, dm.dm_pels_height) {

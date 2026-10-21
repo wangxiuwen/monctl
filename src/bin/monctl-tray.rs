@@ -667,11 +667,13 @@ mod tray {
                 std::thread::spawn(move || {
                     let hwnd = hwnd_addr as HWND;
                     let displays = monctl::windows::list();
+                    // the virtual display driver's parked monitor belongs to `cast`
+                    let vdd = monctl::windows::adapters_named(monctl::winvdd::ADAPTER_NAME, false);
                     let mut ids: Vec<String> = displays.iter().filter(|d| !d.active).map(|d| d.id.clone()).collect();
                     ids.extend(common::load_state().keys().cloned());
                     ids.sort();
                     ids.dedup();
-                    ids.retain(|id| !displays.iter().any(|d| d.id == *id && d.active));
+                    ids.retain(|id| !displays.iter().any(|d| d.id == *id && d.active) && !vdd.contains(id));
                     let mut done = 0;
                     for id in ids {
                         if monctl::windows::set_enabled(&id, true).is_ok() {
@@ -878,6 +880,11 @@ mod tray {
 
     pub fn run() -> std::process::ExitCode {
         escape_job_if_needed();
+        // after a reboot the virtual display driver brings its monitor back;
+        // unless a cast session is using it, keep it off the desktop
+        if std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], monctl::cast::DEFAULT_PORT).into(), std::time::Duration::from_millis(300)).is_err() {
+            monctl::winvdd::park();
+        }
         unsafe {
             let class_name = wide("monctl_tray_wnd");
             let hinstance = std::ptr::null_mut();
