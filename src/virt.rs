@@ -37,6 +37,21 @@ extern "C" {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGGetOnlineDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    fn CGDisplayCopyDisplayMode(d: u32) -> *mut c_void;
+    fn CGDisplayModeGetPixelWidth(m: *const c_void) -> usize;
+    fn CGDisplayModeRelease(m: *mut c_void);
+}
+
+fn has_mode(id: u32) -> bool {
+    unsafe {
+        let m = CGDisplayCopyDisplayMode(id);
+        if m.is_null() {
+            return false;
+        }
+        let ok = CGDisplayModeGetPixelWidth(m) > 0;
+        CGDisplayModeRelease(m);
+        ok
+    }
 }
 
 #[repr(C)]
@@ -264,8 +279,9 @@ fn online_ids() -> Vec<u32> {
     }
 }
 
-/// Create the display in this process. The returned object must stay alive.
-unsafe fn create(spec: &Spec, serial: u32, name: &str) -> Result<(Id, u32), String> {
+/// Create the display in this process. It exists as long as the returned
+/// object does (`release`) - or until the process ends.
+pub unsafe fn create(spec: &Spec, serial: u32, name: &str) -> Result<(Id, u32), String> {
     for c in ["CGVirtualDisplay", "CGVirtualDisplayDescriptor", "CGVirtualDisplaySettings", "CGVirtualDisplayMode"] {
         if class(c).is_null() {
             return Err(format!("{c} not available on this macOS version (needs macOS 11+)"));
@@ -302,14 +318,21 @@ unsafe fn create(spec: &Spec, serial: u32, name: &str) -> Result<(Id, u32), Stri
     if id == 0 {
         return Err("virtual display got no display id".into());
     }
-    // wait until it is actually online so the caller can address it right away
+    // wait until it is online *with a mode*, so the caller can configure or
+    // capture it right away (a stream started before the first mode lands
+    // never delivers a frame of a static screen)
     for _ in 0..50 {
-        if online_ids().contains(&id) {
+        if online_ids().contains(&id) && has_mode(id) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok((display, id))
+}
+
+/// Destroy a display made by `create` in this process.
+pub unsafe fn release(display: Id) {
+    send(display, "release");
 }
 
 fn holder(args: &[String]) -> ! {

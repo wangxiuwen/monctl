@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>monctl screen</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none;
+    touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  #c, #v { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; display: none; }
+  #touch { position: fixed; inset: 0; }
+  #bar { position: fixed; right: 12px; bottom: 12px; display: flex; gap: 6px; align-items: center;
+    font: 13px -apple-system, system-ui, sans-serif; color: #fff; opacity: .4; transition: opacity .2s; z-index: 2; }
+  #bar:hover, #bar.on { opacity: .95; }
+  #bar button { font: inherit; color: #fff; background: rgba(40,40,40,.85); border: 1px solid rgba(255,255,255,.2);
+    border-radius: 8px; padding: 8px 11px; min-width: 40px; }
+  #status { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center;
+    color: #ccc; font: 17px -apple-system, system-ui, sans-serif; padding: 24px; white-space: pre-line; pointer-events: none; }
+  #kbd { position: fixed; left: -1000px; top: 0; width: 10px; height: 10px; opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="v" muted playsinline autoplay disablepictureinpicture></video>
+<div id="touch"></div>
+<div id="status">connecting…</div>
+<textarea id="kbd" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+<div id="bar"><span id="info"></span><button id="kb" title="keyboard">⌨</button><button id="fs" title="full screen">⛶</button></div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const canvas = $("c"), video = $("v"), statusEl = $("status"), info = $("info");
+const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+
+const clientId = (() => {
+  try {
+    let id = localStorage.getItem("monctl-id");
+    if (!id) { id = Math.random().toString(36).slice(2, 12); localStorage.setItem("monctl-id", id); }
+    return id;
+  } catch (e) { return Math.random().toString(36).slice(2, 12); }
+})();
+const label = new URLSearchParams(location.search).get("name") || (() => {
+  const ua = navigator.userAgent;
+  if (/iPad/.test(ua) || (/Macintosh/.test(ua) && "ontouchend" in document)) return "iPad";
+  if (/Android/.test(ua)) return "Android tablet";
+  if (/Windows/.test(ua)) return "Windows tablet";
+  return "Tablet";
+})();
+
+// The virtual screen matches this device's full screen (not the browser
+// viewport, which shrinks with toolbars): same orientation, CSS pixels.
+function screenSize() {
+  const a = screen.width, b = screen.height;
+  const landscape = innerWidth >= innerHeight;
+  return landscape ? [Math.max(a, b), Math.min(a, b)] : [Math.min(a, b), Math.max(a, b)];
+}
+
+let ws, frameW = 0, frameH = 0, decoder = null, mse = null, waitKey = true, sentSize = "";
+let frames = 0, bytes = 0;
+const useWebCodecs = "VideoDecoder" in window && window.isSecureContext;
+
+function show(msg) { statusEl.textContent = msg; statusEl.style.display = msg ? "flex" : "none"; }
+
+// ---------- WebCodecs (secure contexts: localhost over USB) ----------
+function setupWebCodecs(codec, avcc) {
+  if (decoder) try { decoder.close(); } catch (e) {}
+  decoder = new VideoDecoder({
+    output: f => {
+      if (canvas.width !== f.displayWidth || canvas.height !== f.displayHeight) {
+        canvas.width = f.displayWidth; canvas.height = f.displayHeight;
+      }
+      ctx.drawImage(f, 0, 0); f.close();
+    },
+    error: () => { waitKey = true; send("key"); setupWebCodecs(codec, avcc); },
+  });
+  decoder.configure({ codec, description: avcc, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
+  canvas.style.display = "block"; video.style.display = "none";
+}
+
+// ---------- Media Source Extensions (plain http on the LAN) ----------
+// H.264 access units are wrapped into fragmented MP4 right here.
+function box(type, ...parts) {
+  let len = 8; for (const p of parts) len += p.length;
+  const out = new Uint8Array(len), dv = new DataView(out.buffer);
+  dv.setUint32(0, len); for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+  let o = 8; for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+function bytesOf(...vals) { // [value, byteCount] pairs, big endian
+  const n = vals.reduce((a, v) => a + v[1], 0), out = new Uint8Array(n); let o = 0;
+  for (const [v, w] of vals) { for (let i = w - 1; i >= 0; i--) out[o + w - 1 - i] = Math.floor(v / 2 ** (8 * i)) & 255; o += w; }
+  return out;
+}
+const str = s => Uint8Array.from(s, c => c.charCodeAt(0));
+const MATRIX = bytesOf([0x10000, 4], [0, 4], [0, 4], [0, 4], [0x10000, 4], [0, 4], [0, 4], [0, 4], [0x40000000, 4]);
+const TIMESCALE = 90000, FRAME = 1500; // 60 fps nominal; 'sequence' mode packs frames back to back
+
+function initSegment(avcc, w, h) {
+  const ftyp = box("ftyp", str("isom"), bytesOf([512, 4]), str("isomiso2avc1mp41"));
+  const mvhd = box("mvhd", bytesOf([0, 4], [0, 4], [0, 4], [1000, 4], [0, 4], [0x10000, 4], [0x100, 2], [0, 10]), MATRIX, new Uint8Array(24), bytesOf([2, 4]));
+  const tkhd = box("tkhd", bytesOf([3, 4], [0, 4], [0, 4], [1, 4], [0, 4], [0, 4], [0, 8], [0, 2], [0, 2], [0, 2], [0, 2]), MATRIX, bytesOf([w * 65536, 4], [h * 65536, 4]));
+  const mdhd = box("mdhd", bytesOf([0, 4], [0, 4], [0, 4], [TIMESCALE, 4], [0, 4], [0x55c4, 2], [0, 2]));
+  const hdlr = box("hdlr", bytesOf([0, 4], [0, 4]), str("vide"), new Uint8Array(12), str("VideoHandler\0"));
+  const avc1 = box("avc1", new Uint8Array(6), bytesOf([1, 2], [0, 16], [w, 2], [h, 2], [0x480000, 4], [0x480000, 4], [0, 4], [1, 2]), new Uint8Array(32), bytesOf([0x18, 2], [0xffff, 2]), box("avcC", avcc));
+  const stbl = box("stbl", box("stsd", bytesOf([0, 4], [1, 4]), avc1), box("stts", bytesOf([0, 8])), box("stsc", bytesOf([0, 8])), box("stsz", bytesOf([0, 12])), box("stco", bytesOf([0, 8])));
+  const minf = box("minf", box("vmhd", bytesOf([1, 4], [0, 8])), box("dinf", box("dref", bytesOf([0, 4], [1, 4]), box("url ", bytesOf([1, 4])))), stbl);
+  const trak = box("trak", tkhd, box("mdia", mdhd, hdlr, minf));
+  const mvex = box("mvex", box("trex", bytesOf([0, 4], [1, 4], [1, 4], [0, 4], [0, 4], [0, 4])));
+  const moov = box("moov", mvhd, trak, mvex);
+  const out = new Uint8Array(ftyp.length + moov.length); out.set(ftyp); out.set(moov, ftyp.length);
+  return out;
+}
+let seq = 0, decodeTime = 0;
+function fragment(data, key) {
+  const flags = key ? 0x02000000 : 0x01010000, n = ++seq;
+  const build = off => box("moof", box("mfhd", bytesOf([0, 4], [n, 4])),
+    box("traf", box("tfhd", bytesOf([0x020000, 4], [1, 4])), box("tfdt", bytesOf([0x01000000, 4], [decodeTime, 8])),
+      box("trun", bytesOf([0x000701, 4], [1, 4], [off, 4], [FRAME, 4], [data.length, 4], [flags, 4]))));
+  // data_offset counts from the start of moof to the sample: moof + mdat header
+  const moof = build(build(0).length + 8), mdat = box("mdat", data);
+  decodeTime += FRAME;
+  const out = new Uint8Array(moof.length + mdat.length); out.set(moof); out.set(mdat, moof.length);
+  return out;
+}
+function setupMSE(codec, avcc, w, h) {
+  const MS = window.ManagedMediaSource || window.MediaSource;
+  if (!MS) { show("This browser can't play the stream.\nTry Chrome, Edge or Safari 13+ (open the page over USB for the best latency)."); return; }
+  const src = new MS(), queue = [initSegment(avcc, w, h)];
+  video.disableRemotePlayback = true;
+  video.src = URL.createObjectURL(src);
+  mse = { src, sb: null, queue };
+  src.addEventListener("sourceopen", () => {
+    const sb = src.addSourceBuffer(`video/mp4; codecs="${codec}"`);
+    sb.mode = "sequence";
+    sb.addEventListener("updateend", () => { pump(); chase(); });
+    mse.sb = sb; pump();
+  }, { once: true });
+  canvas.style.display = "none"; video.style.display = "block";
+}
+function pump() {
+  if (!mse || !mse.sb || mse.sb.updating || !mse.queue.length) return;
+  try { mse.sb.appendBuffer(mse.queue.shift()); } catch (e) { waitKey = true; send("key"); }
+}
+// Live, not a movie: keep the playhead glued to the newest frame.
+function chase() {
+  const b = video.buffered; if (!b.length) return;
+  const end = b.end(b.length - 1);
+  if (end - video.currentTime > 0.12) video.currentTime = Math.max(b.start(b.length - 1), end - 0.02);
+  if (b.start(0) < end - 10 && !mse.sb.updating) try { mse.sb.remove(0, end - 5); } catch (e) {}
+  if (video.paused) video.play().catch(() => {});
+}
+
+// ---------- connection ----------
+let retry = 0, lastError = "";
+function connect() {
+  const [w, h] = screenSize();
+  sentSize = `${w}x${h}`;
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  // back-off resets only once frames flow: a server that accepts and then
+  // fails must not be hammered every 500ms
+  ws.onopen = () => { show("waiting for the first frame…"); ws.send(`h ${w} ${h} ${devicePixelRatio} ${clientId} ${label}`); };
+  ws.onmessage = ev => {
+    if (typeof ev.data === "string") {
+      const [kind, ...rest] = ev.data.split(" ");
+      if (kind === "cfg") {
+        const [codec, w, h, b64] = rest;
+        frameW = +w; frameH = +h; waitKey = true;
+        const avcc = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        if (useWebCodecs) setupWebCodecs(codec, avcc);
+        else if (!mse) setupMSE(codec, avcc, frameW, frameH);
+        else mse.queue.push(initSegment(avcc, frameW, frameH));
+      } else if (kind === "err") { lastError = rest.join(" "); show(lastError); retry = Math.max(retry, 4); }
+      return;
+    }
+    const buf = new Uint8Array(ev.data), key = buf[0] === 1;
+    if (waitKey && !key) return;
+    if (waitKey) { waitKey = false; retry = 0; lastError = ""; show(""); }
+    const data = buf.subarray(9);
+    frames++; bytes += buf.length;
+    if (useWebCodecs && decoder && decoder.state === "configured") {
+      const ts = Number(new DataView(ev.data).getBigUint64(1));
+      decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: ts, data }));
+    } else if (mse) {
+      mse.queue.push(fragment(data, key)); pump();
+    }
+  };
+  ws.onclose = () => {
+    show(lastError ? `${lastError}\n(retrying…)` : "reconnecting…");
+    if (mse) { try { URL.revokeObjectURL(video.src); } catch (e) {} mse = null; seq = 0; decodeTime = 0; }
+    setTimeout(connect, Math.min(10000, 500 * 2 ** retry++));
+  };
+}
+function send(s) { if (ws && ws.readyState === 1) ws.send(s); }
+setInterval(() => {
+  info.textContent = frames ? `${frames} fps · ${(bytes * 8 / 1e6).toFixed(1)} Mbit/s · ${useWebCodecs ? "USB" : "Wi-Fi"}` : "";
+  frames = 0; bytes = 0;
+}, 1000);
+
+// rotate → a new screen size → reconnect for a matching virtual display
+let resizeTimer;
+addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { const [w, h] = screenSize(); if (`${w}x${h}` !== sentSize && ws) ws.close(); }, 600);
+});
+
+// ---------- input ----------
+// Map a page point into 0..1 of the streamed picture (letterboxed by object-fit).
+function norm(x, y) {
+  const W = innerWidth, H = innerHeight;
+  const fw = frameW || W, fh = frameH || H, s = Math.min(W / fw, H / fh);
+  const w = fw * s, h = fh * s, ox = (W - w) / 2, oy = (H - h) / 2;
+  return [((x - ox) / w).toFixed(4), ((y - oy) / h).toFixed(4)];
+}
+const surface = $("touch"), pointers = new Map();
+let pending = null, dragging = false, scrolling = null, longTimer = null;
+
+surface.addEventListener("pointerdown", e => {
+  e.preventDefault(); surface.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (e.pointerType !== "touch") { // pen / mouse: direct
+    send(`d ${norm(e.clientX, e.clientY).join(" ")} ${e.button === 2 ? 2 : 0}`); dragging = true; return;
+  }
+  if (pointers.size === 1) {
+    // a touch is a click, a drag, or a long press (right click) - decide on movement/time
+    pending = { x: e.clientX, y: e.clientY };
+    longTimer = setTimeout(() => {
+      if (!pending) return;
+      const p = norm(pending.x, pending.y).join(" ");
+      send(`m ${p}`); send(`d ${p} 2`); send(`u ${p} 2`); pending = null;
+      if (navigator.vibrate) navigator.vibrate(15);
+    }, 550);
+  } else if (pointers.size === 2) {
+    clearTimeout(longTimer); pending = null;
+    if (dragging) { const p = [...pointers.values()][0]; send(`u ${norm(p.x, p.y).join(" ")} 0`); dragging = false; }
+    const c = centroid(); scrolling = c; send(`m ${norm(c.x, c.y).join(" ")}`);
+  }
+});
+function centroid() {
+  let x = 0, y = 0; for (const p of pointers.values()) { x += p.x; y += p.y; }
+  return { x: x / pointers.size, y: y / pointers.size };
+}
+surface.addEventListener("pointermove", e => {
+  if (!pointers.has(e.pointerId)) {
+    if (e.pointerType !== "touch") send(`m ${norm(e.clientX, e.clientY).join(" ")}`); // hover
+    return;
+  }
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (scrolling) {
+    const c = centroid(), dx = Math.round(c.x - scrolling.x), dy = Math.round(c.y - scrolling.y);
+    if (dx || dy) { send(`s ${dx} ${dy}`); scrolling = c; }
+    return;
+  }
+  if (pending && Math.hypot(e.clientX - pending.x, e.clientY - pending.y) > 8) {
+    clearTimeout(longTimer);
+    const p = norm(pending.x, pending.y).join(" ");
+    send(`m ${p}`); send(`d ${p} 0`); dragging = true; pending = null;
+  }
+  if (dragging) send(`m ${norm(e.clientX, e.clientY).join(" ")}`);
+});
+function up(e) {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.delete(e.pointerId); clearTimeout(longTimer);
+  const p = norm(e.clientX, e.clientY).join(" ");
+  if (pending) { send(`m ${p}`); send(`d ${p} 0`); send(`u ${p} 0`); pending = null; }
+  else if (dragging) { send(`u ${p} ${e.pointerType !== "touch" && e.button === 2 ? 2 : 0}`); dragging = false; }
+  if (pointers.size < 2) scrolling = null;
+}
+surface.addEventListener("pointerup", up);
+surface.addEventListener("pointercancel", up);
+surface.addEventListener("contextmenu", e => e.preventDefault());
+
+// keyboard: a hidden textarea brings up the on-screen keyboard
+const kbd = $("kbd");
+$("kb").onclick = () => { kbd.value = ""; kbd.focus(); };
+kbd.addEventListener("beforeinput", e => {
+  e.preventDefault();
+  if (e.inputType === "insertText" && e.data) send(`t ${e.data}`);
+  else if (e.inputType === "insertLineBreak" || e.inputType === "insertParagraph") send("k Enter");
+  else if (e.inputType === "deleteContentBackward") send("k Backspace");
+  else if (e.inputType === "deleteContentForward") send("k Delete");
+});
+kbd.addEventListener("keydown", e => {
+  if (["Tab", "Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) { e.preventDefault(); send(`k ${e.key}`); }
+});
+$("fs").onclick = () => {
+  const d = document.documentElement;
+  (d.requestFullscreen || d.webkitRequestFullscreen || (() => {})).call(d);
+  if (navigator.wakeLock) navigator.wakeLock.request("screen").catch(() => {});
+};
+$("bar").addEventListener("pointerdown", e => e.stopPropagation());
+
+connect();
+</script>
+</body>
+</html>

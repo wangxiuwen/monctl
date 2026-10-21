@@ -356,6 +356,10 @@ fn main() {
         "sleep" => awake::sleep_now(),
         #[cfg(target_os = "macos")]
         "virtual" | "virt" => monctl::virt::run(&args[1..]),
+        #[cfg(target_os = "macos")]
+        "cast" | "tablet" => monctl::cast::run(&args[1..]),
+        #[cfg(not(target_os = "macos"))]
+        "cast" | "tablet" => fail("casting to a tablet is macOS-only for now"),
         #[cfg(not(target_os = "macos"))]
         "virtual" | "virt" => fail("virtual displays are macOS-only for now (Windows needs an indirect display driver)"),
         _ => {}
