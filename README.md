@@ -12,8 +12,8 @@ tray app). macOS / Windows / Linux.
   as Retina.
 - **Virtual displays** (macOS) — any size, HiDPI, for headless Macs and
   screen sharing.
-- **Any tablet as an extra screen** (macOS → iPad / Android / Windows
-  tablets) — over Wi-Fi or USB, nothing to install on the tablet.
+- **Any tablet as an extra screen** (macOS or Windows → iPad / Android /
+  Windows tablets) — over Wi-Fi or USB, nothing to install on the tablet.
 - **Keep awake** / sleep now.
 
 ```console
@@ -43,7 +43,7 @@ From [Releases](../../releases/latest):
 | | |
 | --- | --- |
 | macOS | `monctl-macos.dmg` — drag **monctl.app** to Applications. It lives in the menu bar; the CLI is inside: `ln -s /Applications/monctl.app/Contents/MacOS/monctl /usr/local/bin/monctl`. Not notarized: the first launch needs right-click → Open (or System Settings → Privacy & Security → Open Anyway). |
-| Windows | `monctl-setup.exe` — per-user install, no admin; options for sign-in autostart and adding `monctl` to PATH. Or `monctl-windows-x64.zip` (portable). |
+| Windows | `monctl-setup.exe` — per-user install; options for sign-in autostart, adding `monctl` to PATH, and the screen driver for tablets (one admin prompt). Or `monctl-windows-x64.zip` (portable; it installs the driver itself on first use). |
 | Linux | `monctl-linux-x64.tar.gz` |
 
 Or `cargo build --release` (see [Build](#build)).
@@ -64,7 +64,8 @@ monctl main ID               make a display the main one (menu bar, Dock / taskb
 monctl mirror ID [SOURCE]    show SOURCE (default: main) on display ID; `mirror off` undoes
 monctl hidpi [ID] | off [ID] macOS: crisp HiDPI rendering on any monitor
 monctl virtual [add [WxH[@Hz]] [--name N] [--no-hidpi] | rm ID|all]   macOS
-monctl cast [--port N] [--display ID|main] [--bitrate MBPS]          macOS
+monctl cast [--port N] [--display ID|main] [--bitrate MBPS]          macOS, Windows
+monctl driver [status|install|uninstall|restart]                     Windows: cast's screen driver
 
 monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)
 monctl awake off|status      release / inspect the hold (--display also keeps the screen on)
@@ -142,7 +143,7 @@ record it, set its resolution with `monctl mode`. Useful on headless Macs
 (remote desktop at any resolution) and as a private screen during screen
 sharing. Each one is owned by a tiny holder process; it disappears with it.
 
-## Tablets as extra screens (macOS)
+## Tablets as extra screens (macOS, Windows)
 
 ```console
 $ monctl cast
@@ -172,8 +173,24 @@ it. Nothing to install on the tablet — it's a web page.
   VideoToolbox H.264 in low-latency mode → WebSocket. One worker process per
   tablet: when the tablet leaves, its screen goes with it.
 
-In the menu bar app it's one click (**投屏到平板**), with the QR code in a
-window and the number of connected tablets in the menu.
+In both tray apps it's one click (**投屏到平板**): the QR code pops up
+(a window on macOS, a page on Windows) and the menu shows how many tablets
+are connected.
+
+**On Windows** a new screen needs an indirect display driver. monctl
+embeds the open-source [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
+(MIT, signed by SignPath Foundation through a GlobalSign chain Windows
+already trusts) and installs it itself - from the installer, or on the
+first cast with a single admin prompt. Nothing is added to the root
+certificate store; the driver's publisher goes into *Trusted Publishers*
+only, so Windows doesn't ask a second time. The driver keeps a small pool
+of screens parked off the desktop; a tablet claims one at its exact size
+and scale (an iPad at 2x gets 200%), and hands it back when it leaves.
+`monctl driver status|uninstall` shows / removes it.
+
+- Capture: DXGI Desktop Duplication; encode: Media Foundation H.264 on the
+  GPU (NVENC / Quick Sync / AMF), software fallback.
+- Up to 4 tablets at a time.
 
 ## Keeping the machine awake
 
@@ -238,7 +255,8 @@ Feature support:
 | on / off / solo | ✓ | ✓ (not the primary) | ✓ X11, KDE Wayland |
 | mode / main | ✓ (incl. HiDPI modes) | ✓ | ✓ |
 | mirror | ✓ | Win+P | ✓ X11 |
-| hidpi, virtual, cast | ✓ | – (needs a virtual display driver) | – |
+| hidpi, virtual | ✓ | – | – |
+| cast (tablets) | ✓ | ✓ (bundled driver) | – |
 | awake / sleep | ✓ | ✓ | ✓ |
 | tray app | ✓ | ✓ | – |
 
@@ -309,4 +327,5 @@ runs on Windows and Linux.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Bundled: the Virtual Display Driver binaries in
+[`vendor/vdd`](vendor/vdd) (MIT, [their license](vendor/vdd/LICENSE)), unmodified as signed.

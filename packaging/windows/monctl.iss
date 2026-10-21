@@ -32,6 +32,7 @@ CloseApplications=yes
 [Tasks]
 Name: "autostart"; Description: "Start the tray when I sign in / 登录时自动启动托盘"
 Name: "addpath"; Description: "Add monctl to PATH / 把 monctl 加入 PATH（任意终端可用）"
+Name: "screendriver"; Description: "Install the screen driver for tablets as extra screens (asks for admin once) / 安装平板扩展屏用的屏幕驱动（需要管理员授权一次）"
 
 [Files]
 Source: "{#Src}\monctl.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -46,6 +47,9 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Tasks: addpath; Check: NeedsPath(ExpandConstant('{app}'))
 
 [Run]
+; the open-source Virtual Display Driver (signed, embedded in monctl.exe): done now so
+; the first "投屏到平板" just works - otherwise monctl asks for it on first use
+Filename: "{app}\monctl.exe"; Parameters: "driver install"; Verb: "runas"; Flags: shellexec runhidden waituntilterminated; StatusMsg: "Installing the screen driver..."; Tasks: screendriver
 Filename: "{app}\monctl-tray.exe"; Description: "Start monctl now / 立即启动 monctl 托盘"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
@@ -64,8 +68,11 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Paths, Dir: string;
-  P: Integer;
+  P, Code: Integer;
 begin
+  // the screen driver (if it was installed) goes too - while monctl.exe still exists
+  if (CurUninstallStep = usUninstall) and DirExists(ExpandConstant('{commonappdata}\monctl\vdd')) then
+    ShellExec('runas', ExpandConstant('{app}\monctl.exe'), 'driver uninstall', '', SW_HIDE, ewWaitUntilTerminated, Code);
   if CurUninstallStep <> usPostUninstall then
     exit;
   if not RegQueryStringValue(HKCU, 'Environment', 'Path', Paths) then

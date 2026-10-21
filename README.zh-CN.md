@@ -8,7 +8,7 @@
 - **分辨率**（包括系统设置里藏起来的 HiDPI 模式）、**设主屏**、**镜像**，一条命令搞定。
 - **任意显示器开 HiDPI**（macOS）——非 Retina 外接屏也能显示锐利的文字。
 - **虚拟显示器**（macOS）——任意尺寸，支持 HiDPI，适合无头 Mac 和屏幕共享。
-- **平板当副屏**（macOS → iPad / 安卓 / Windows 平板）——无线、有线都行，平板上什么都不用装。
+- **平板当副屏**（macOS 或 Windows → iPad / 安卓 / Windows 平板）——无线、有线都行，平板上什么都不用装。
 - **防休眠** / 立即休眠。
 
 ```console
@@ -37,7 +37,7 @@ enabled  5 "DELL P2314H" (n/a)
 | | |
 | --- | --- |
 | macOS | `monctl-macos.dmg`——把 **monctl.app** 拖进「应用程序」，它常驻菜单栏；命令行工具在 app 里面：`ln -s /Applications/monctl.app/Contents/MacOS/monctl /usr/local/bin/monctl`。未公证，第一次打开要右键 → 打开（或 系统设置 → 隐私与安全性 → 仍要打开）。 |
-| Windows | `monctl-setup.exe`——装到当前用户目录，不需要管理员；可选开机自启、加入 PATH。也有便携版 `monctl-windows-x64.zip`。 |
+| Windows | `monctl-setup.exe`——装到当前用户目录；可选开机自启、加入 PATH、安装平板投屏用的屏幕驱动（授权一次管理员）。也有便携版 `monctl-windows-x64.zip`（第一次投屏时自己装驱动）。 |
 | Linux | `monctl-linux-x64.tar.gz` |
 
 或者自己 `cargo build --release`（见[构建](#构建)）。
@@ -58,7 +58,8 @@ monctl main ID               设为主屏（菜单栏、Dock / 任务栏跟过�
 monctl mirror ID [源]        让 ID 显示「源」的画面（默认主屏）；mirror off 取消
 monctl hidpi [ID] | off [ID] macOS：任意显示器开 HiDPI
 monctl virtual [add [WxH[@Hz]] [--name 名字] [--no-hidpi] | rm ID|all]   macOS 虚拟显示器
-monctl cast [--port 端口] [--display ID|main] [--bitrate Mbps]           macOS 平板当副屏
+monctl cast [--port 端口] [--display ID|main] [--bitrate Mbps]           平板当副屏（macOS、Windows）
+monctl driver [status|install|uninstall|restart]                        Windows：投屏用的屏幕驱动
 
 monctl awake [时长]          阻止休眠（2h、90m、2h30m、3600；不带时长 = 直到解除）
 monctl awake off|status      解除 / 查看保持状态（--display 连屏幕一起常亮）
@@ -123,7 +124,7 @@ $ monctl virtual rm 8                   # 或 rm all
 `monctl mode` 改分辨率。适合无头 Mac（任意分辨率远程桌面），或者屏幕共享时
 放一块「私人屏」。每块虚拟屏挂在一个小 holder 进程上，进程没了屏也就没了。
 
-## 平板当副屏（macOS）
+## 平板当副屏（macOS、Windows）
 
 ```console
 $ monctl cast
@@ -146,7 +147,18 @@ USB  Android R58N...: wired via adb, opened http://localhost:8484/ on the tablet
 - 原理：CGDisplayStream（画面有变化才出帧）→ VideoToolbox 低延迟 H.264 →
   WebSocket。每台平板一个 worker 进程，平板一走，它的屏跟着消失。
 
-菜单栏应用里一键搞定（**投屏到平板**）：弹出二维码窗口，菜单上显示已连接几台平板。
+两个托盘应用里都是一键搞定（**投屏到平板**）：弹出二维码（macOS 是窗口，Windows 是网页），菜单上显示已连接几台平板。
+
+**Windows 上**新增一块屏需要虚拟显示驱动。monctl 内置了开源的
+[Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
+（MIT 许可，由 SignPath 基金会签名，签名链是 Windows 本来就信任的 GlobalSign），
+并且自己负责安装——安装器里装，或者第一次投屏时授权一次管理员。不会往根证书里加任何东西，
+只是把驱动发布者加入「受信任的发布者」，免得 Windows 再问一遍。驱动平时保留一小池屏幕、
+全部停放在桌面之外；平板连上时认领一块，按它的精确尺寸和缩放（2 倍屏的 iPad 就是 200%），
+离开时归还。`monctl driver status|uninstall` 查看 / 卸载。
+
+- 抓屏：DXGI 桌面复制；编码：GPU 上的 Media Foundation H.264（NVENC / Quick Sync / AMF），没有则用软件编码。
+- 最多同时 4 台平板。
 
 ## 防休眠
 
@@ -194,7 +206,8 @@ macOS 上的保持同时包含 `PreventSystemSleep`（即 `caffeinate -s` 的效
 | 开关 / solo | ✓ | ✓（主屏除外） | ✓ X11、KDE Wayland |
 | 分辨率 / 主屏 | ✓（含 HiDPI 模式） | ✓ | ✓ |
 | 镜像 | ✓ | Win+P | ✓ X11 |
-| hidpi、虚拟显示器、平板投屏 | ✓ | –（需要虚拟显示驱动） | – |
+| hidpi、虚拟显示器 | ✓ | – | – |
+| 平板投屏 | ✓ | ✓（内置驱动） | – |
 | 防休眠 / 休眠 | ✓ | ✓ | ✓ |
 | 托盘应用 | ✓ | ✓ | – |
 
@@ -252,4 +265,5 @@ monctl 把它们最有用的内核做成一个零依赖、可脚本化的小二�
 
 ## 许可
 
-MIT —— 见 [LICENSE](LICENSE)。
+MIT —— 见 [LICENSE](LICENSE)。内置的 Virtual Display Driver 驱动文件在
+[`vendor/vdd`](vendor/vdd)（MIT，[其许可](vendor/vdd/LICENSE)），保持签名原样未改动。

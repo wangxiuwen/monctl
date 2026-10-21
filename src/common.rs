@@ -30,6 +30,8 @@ usage:
   monctl mirror ID [SOURCE]    show SOURCE (default: main) on display ID; `mirror off` undoes
   monctl hidpi [ID] | off [ID] macOS: crisp HiDPI rendering on any monitor
   monctl virtual [add [WxH[@Hz]] [--name N] [--no-hidpi] | rm ID|all]   macOS: virtual displays
+  monctl cast [--port N] [--display ID|main]   tablets (iPad/Android/Windows) as extra screens
+  monctl driver [status|install|uninstall]     Windows: the screen driver cast uses
 
   monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)
   monctl awake off|status      release / inspect the hold (--display also keeps the screen on)
