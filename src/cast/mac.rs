@@ -577,6 +577,12 @@ pub(super) fn dispatch(sock: TcpStream, opts: &Options) {
     }
 }
 
+/// Stop casting: workers notice their server is gone and end, and each
+/// tablet's virtual display ends with its worker.
+pub(super) fn shutdown() -> ! {
+    std::process::exit(0)
+}
+
 /// `monctl cast --worker`: run one session on the socket handed over as fd 3.
 pub(super) fn worker(opts: &Options) -> ! {
     use std::os::fd::FromRawFd;
@@ -636,7 +642,12 @@ fn spawn_worker(sock: &TcpStream, opts: &Options) -> std::io::Result<()> {
         });
     }
     let mut child = cmd.spawn()?;
-    std::thread::spawn(move || child.wait()); // reap it
+    // a worker lives exactly as long as its tablet is connected
+    super::TABLETS.fetch_add(1, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        super::TABLETS.fetch_sub(1, Ordering::Relaxed);
+    });
     Ok(())
 }
 

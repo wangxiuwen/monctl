@@ -93,6 +93,9 @@ extern "system" {
 extern "system" {
     fn GetStdHandle(which: i32) -> Ptr;
     fn SetHandleInformation(h: Ptr, mask: u32, flags: u32) -> i32;
+    fn GetConsoleMode(h: Ptr, mode: *mut u32) -> i32;
+    fn SetConsoleMode(h: Ptr, mode: u32) -> i32;
+    fn SetConsoleCtrlHandler(handler: extern "system" fn(u32) -> i32, add: i32) -> i32;
 }
 
 #[link(name = "user32")]
@@ -1025,6 +1028,13 @@ pub(super) fn prepare(opts: &Options) {
         for std in [-10i32, -11, -12] {
             SetHandleInformation(GetStdHandle(std), 1, 0); // HANDLE_FLAG_INHERIT off
         }
+        // colours for the terminal QR code (conhost needs VT processing switched on)
+        let out = GetStdHandle(-11);
+        let mut mode = 0u32;
+        if GetConsoleMode(out, &mut mode) != 0 {
+            SetConsoleMode(out, mode | 0x0004);
+        }
+        SetConsoleCtrlHandler(on_console_close, 1);
     }
     if opts.display.is_none() {
         // the one moment a UAC prompt may appear: installing the screen driver
@@ -1049,7 +1059,21 @@ pub(super) fn resolve_display(token: &str) -> Result<String, String> {
 /// Sessions run on the connection's thread: no CoreGraphics-style per-process
 /// cache to dodge on Windows, and the monitor pool must be shared anyway.
 pub(super) fn dispatch(sock: std::net::TcpStream, opts: &Options) {
+    super::TABLETS.fetch_add(1, Ordering::Relaxed);
     super::session(sock, opts);
+    super::TABLETS.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Stop casting. Sessions live in this process, so their screens must be
+/// handed back to the pool (off the desktop) before it ends.
+pub(super) fn shutdown() -> ! {
+    winvdd::park();
+    reassert_off();
+    std::process::exit(0)
+}
+
+extern "system" fn on_console_close(_: u32) -> i32 {
+    shutdown() // Ctrl+C / closing the console window
 }
 
 pub(super) fn worker(_opts: &Options) -> ! {

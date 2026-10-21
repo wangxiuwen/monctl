@@ -354,6 +354,21 @@ pub fn terminal(text: &str) -> String {
     out
 }
 
+/// The code as an SVG (black on white, 4-module quiet zone) for pages.
+pub fn svg(text: &str) -> String {
+    let Some(m) = encode(text) else { return String::new() };
+    let n = m.len() + 8;
+    let mut path = String::new();
+    for (y, row) in m.iter().enumerate() {
+        for (x, &dark) in row.iter().enumerate() {
+            if dark {
+                path.push_str(&format!("M{} {}h1v1h-1z", x + 4, y + 4));
+            }
+        }
+    }
+    format!("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {n} {n}\" shape-rendering=\"crispEdges\"><rect width=\"{n}\" height=\"{n}\" fill=\"#fff\"/><path d=\"{path}\" fill=\"#000\"/></svg>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

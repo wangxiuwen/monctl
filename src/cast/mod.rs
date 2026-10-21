@@ -32,6 +32,12 @@ mod win;
 use win as platform;
 
 const PAGE: &str = include_str!("page.html");
+const HOST_PAGE: &str = include_str!("host.html");
+
+/// Connected tablets (sessions), for /status and the trays.
+pub(crate) static TABLETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The address tablets should open (first LAN address), for /status and /qr.svg.
+static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 pub const DEFAULT_PORT: u16 = 8484;
 
 /// What an encoder hands the WebSocket writer.
@@ -224,6 +230,23 @@ fn handle(mut sock: TcpStream, opts: &Options) {
         // after it has seen our 101
         drop(reader);
         platform::dispatch(sock, opts);
+    } else if path == "/status" {
+        let body = format!(
+            "{{\"tablets\":{},\"url\":\"{}\"}}",
+            TABLETS.load(std::sync::atomic::Ordering::Relaxed),
+            URL.get().map(String::as_str).unwrap_or("")
+        );
+        reply(&mut sock, "application/json", &body);
+    } else if path == "/qr.svg" {
+        reply(&mut sock, "image/svg+xml", &crate::qr::svg(URL.get().map(String::as_str).unwrap_or("")));
+    } else if path == "/host" {
+        reply(&mut sock, "text/html; charset=utf-8", HOST_PAGE);
+    } else if path == "/quit" {
+        // stop casting (the trays' "stop"): only from this machine
+        if sock.peer_addr().is_ok_and(|a| a.ip().is_loopback()) {
+            reply(&mut sock, "text/plain", "bye");
+            platform::shutdown();
+        }
     } else if path == "/" || path.starts_with("/?") || path == "/index.html" {
         let _ = write!(
             sock,
@@ -233,6 +256,10 @@ fn handle(mut sock: TcpStream, opts: &Options) {
     } else {
         let _ = write!(sock, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     }
+}
+
+fn reply(sock: &mut TcpStream, kind: &str, body: &str) {
+    let _ = write!(sock, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len());
 }
 
 pub(crate) fn session(sock: TcpStream, opts: &Options) {
@@ -412,6 +439,9 @@ pub fn serve(opts: Options) -> ! {
     let listener = TcpListener::bind(("0.0.0.0", opts.port)).unwrap_or_else(|e| fail(&format!("cannot listen on port {}: {e}", opts.port)));
     platform::prepare(&opts);
     let addrs = lan_addresses();
+    if let Some(a) = addrs.first() {
+        let _ = URL.set(format!("http://{a}:{}/", opts.port));
+    }
     println!("monctl cast - open on the tablet (same Wi-Fi):");
     for a in &addrs {
         println!("  http://{a}:{}/", opts.port);

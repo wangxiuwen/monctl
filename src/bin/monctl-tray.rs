@@ -89,6 +89,8 @@ mod tray {
     const ID_AUTOSTART: u32 = 307;
     const ID_QUIT: u32 = 308;
     const ID_KEEP_DISPLAY: u32 = 309; // one-click screen-sleep prevention toggle
+    const ID_CAST: u32 = 310; // start / stop casting to tablets
+    const ID_CAST_QR: u32 = 311; // show the QR page again
     const AWAKE_SECS: [(&str, u64); 4] = [("1 小时", 3600), ("4 小时", 14400), ("8 小时", 28800), ("不限时", 0)];
 
     #[repr(C)]
@@ -433,6 +435,33 @@ mod tray {
         a
     }
 
+    /// GET a path from the local cast server; None when it isn't running.
+    fn cast_get(path: &str) -> Option<String> {
+        use std::io::{Read, Write};
+        let addr = ([127, 0, 0, 1], monctl::cast::DEFAULT_PORT).into();
+        let mut s = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).ok()?;
+        let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        write!(s, "GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").ok()?;
+        let mut body = String::new();
+        s.read_to_string(&mut body).ok()?;
+        body.split_once("\r\n\r\n").map(|(_, b)| b.to_string())
+    }
+
+    /// Tablets connected to the running cast server; None = not casting.
+    fn cast_tablets() -> Option<usize> {
+        let status = cast_get("/status")?;
+        let n = status.split("\"tablets\":").nth(1)?;
+        n.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()
+    }
+
+    fn open_url(url: &str) {
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(hwnd: HWND, op: *const WCHAR, file: *const WCHAR, params: *const WCHAR, dir: *const WCHAR, show: i32) -> HANDLE;
+        }
+        unsafe { ShellExecuteW(std::ptr::null_mut(), wide("open").as_ptr(), wide(url).as_ptr(), std::ptr::null(), std::ptr::null(), 1) };
+    }
+
     /// The live awake hold, straight from the CLI's own state reader.
     fn awake_state() -> Option<monctl::awake::Status> {
         monctl::awake::current()
@@ -533,6 +562,19 @@ mod tray {
         AppendMenuW(menu, it, ID_SOLO as WPARAM, wide("只留主屏").as_ptr());
         let all_flags = if active_count == displays.len() && !any_off_remembered { MF_STRING | MF_GRAYED } else { MF_STRING };
         AppendMenuW(menu, all_flags, ID_ALL as WPARAM, wide("全部开启 (Ctrl+Alt+Shift+D)").as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+
+        match cast_tablets() {
+            Some(n) => {
+                let label = if n > 0 { format!("停止投屏（已连接 {n} 台平板）") } else { "停止投屏（等待平板连接）".to_string() };
+                AppendMenuW(menu, MF_STRING, ID_CAST as WPARAM, wide(&label).as_ptr());
+                AppendMenuW(menu, MF_STRING, ID_CAST_QR as WPARAM, wide("显示投屏二维码…").as_ptr());
+            }
+            None => {
+                let flags = MF_STRING | if monctl_exe().is_some() { 0 } else { MF_GRAYED };
+                AppendMenuW(menu, flags, ID_CAST as WPARAM, wide("投屏到平板…").as_ptr());
+            }
+        }
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
 
         let awake = awake_state();
@@ -722,6 +764,45 @@ mod tray {
                     notify(hwnd, "屏幕常亮", if turning_off { "已关闭，屏幕可正常休眠" } else { "已开启：屏幕不再休眠，直到再次点击" });
                 }
             }
+            ID_CAST if cast_tablets().is_some() => {
+                let _ = cast_get("/quit"); // the server parks every tablet screen, then exits
+                unsafe { notify(hwnd, "投屏到平板", "已停止，平板的屏幕已移除") };
+            }
+            ID_CAST => {
+                let Some(exe) = monctl_exe() else { return };
+                let hwnd_addr = hwnd as usize;
+                std::thread::spawn(move || {
+                    use std::os::windows::process::CommandExt;
+                    use std::process::{Command, Stdio};
+                    const CREATE_NO_WINDOW: DWORD = 0x0800_0000;
+                    let hwnd = hwnd_addr as HWND;
+                    let started = Command::new(exe)
+                        .arg("cast")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .spawn();
+                    let Ok(mut child) = started else {
+                        unsafe { notify(hwnd, "投屏到平板", "启动失败") };
+                        return;
+                    };
+                    // the first time it may wait on a UAC prompt (screen driver install)
+                    for _ in 0..240 {
+                        if cast_tablets().is_some() {
+                            open_url(&format!("http://localhost:{}/host", monctl::cast::DEFAULT_PORT));
+                            unsafe { notify(hwnd, "投屏到平板", "已开始：用平板扫描浏览器里的二维码") };
+                            return;
+                        }
+                        if let Ok(Some(_)) = child.try_wait() {
+                            unsafe { notify(hwnd, "投屏到平板", "没能启动（需要管理员授权一次来安装屏幕驱动）") };
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                });
+            }
+            ID_CAST_QR => open_url(&format!("http://localhost:{}/host", monctl::cast::DEFAULT_PORT)),
             ID_AUTOSTART => {
                 let on = !autostart_enabled();
                 set_autostart(on);

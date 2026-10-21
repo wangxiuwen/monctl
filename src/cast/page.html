@@ -12,11 +12,19 @@
     touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
   #c, #v { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; display: none; }
   #touch { position: fixed; inset: 0; }
-  #bar { position: fixed; right: 12px; bottom: 12px; display: flex; gap: 6px; align-items: center;
-    font: 13px -apple-system, system-ui, sans-serif; color: #fff; opacity: .4; transition: opacity .2s; z-index: 2; }
-  #bar:hover, #bar.on { opacity: .95; }
-  #bar button { font: inherit; color: #fff; background: rgba(40,40,40,.85); border: 1px solid rgba(255,255,255,.2);
-    border-radius: 8px; padding: 8px 11px; min-width: 40px; }
+  /* a slim handle on the right edge, clear of taskbars, docks, clocks and
+     title-bar buttons; tap (or tap with three fingers) to open the tools */
+  #bar { position: fixed; right: 6px; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column;
+    gap: 8px; align-items: stretch; font: 14px -apple-system, system-ui, sans-serif; color: #fff; z-index: 2; }
+  #handle { width: 22px; height: 64px; border-radius: 11px; background: rgba(60,60,60,.55); border: 1px solid rgba(255,255,255,.25);
+    opacity: .35; align-self: flex-end; }
+  #tools { display: none; flex-direction: column; gap: 8px; background: rgba(28,28,30,.92); border: 1px solid rgba(255,255,255,.18);
+    border-radius: 14px; padding: 10px; min-width: 150px; }
+  #bar.open #tools { display: flex; }
+  #bar.open #handle { display: none; }
+  #tools button { font: inherit; color: #fff; background: rgba(255,255,255,.1); border: 0; border-radius: 9px; padding: 10px 12px; text-align: left; }
+  #info { font-size: 12px; color: #aaa; padding: 2px 4px; }
+  #info:empty { display: none; }
   #status { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center;
     color: #ccc; font: 17px -apple-system, system-ui, sans-serif; padding: 24px; white-space: pre-line; pointer-events: none; }
   #kbd { position: fixed; left: -1000px; top: 0; width: 10px; height: 10px; opacity: 0; }
@@ -26,9 +34,9 @@
 <canvas id="c"></canvas>
 <video id="v" muted playsinline autoplay disablepictureinpicture></video>
 <div id="touch"></div>
-<div id="status">connecting…</div>
+<div id="status"></div>
 <textarea id="kbd" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
-<div id="bar"><span id="info"></span><button id="kb" title="keyboard">⌨</button><button id="fs" title="full screen">⛶</button></div>
+<div id="bar"><div id="handle"></div><div id="tools"><button id="kb"></button><button id="fs"></button><span id="info"></span></div></div>
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
@@ -57,6 +65,20 @@ function screenSize() {
   const landscape = innerWidth >= innerHeight;
   return landscape ? [Math.max(a, b), Math.min(a, b)] : [Math.min(a, b), Math.max(a, b)];
 }
+
+// the tablet's language: Chinese or English
+const T = (navigator.language || "").toLowerCase().startsWith("zh") ? {
+  connecting: "正在连接…", waiting: "等待画面…", reconnecting: "连接断开，正在重连…", retrying: "（正在重试…）",
+  noPlayer: "这个浏览器播放不了画面。\n请用 Chrome、Edge 或 Safari 13 以上（用 USB 线连接延迟最低）。",
+  keyboard: "⌨  键盘", fullscreen: "⛶  全屏",
+} : {
+  connecting: "connecting…", waiting: "waiting for the first frame…", reconnecting: "reconnecting…", retrying: "(retrying…)",
+  noPlayer: "This browser can't play the stream.\nTry Chrome, Edge or Safari 13+ (open the page over USB for the best latency).",
+  keyboard: "⌨  Keyboard", fullscreen: "⛶  Full screen",
+};
+$("kb").textContent = T.keyboard;
+$("fs").textContent = T.fullscreen;
+show(T.connecting);
 
 let ws, frameW = 0, frameH = 0, decoder = null, mse = null, waitKey = true, sentSize = "";
 let frames = 0, bytes = 0;
@@ -127,7 +149,7 @@ function fragment(data, key) {
 }
 function setupMSE(codec, avcc, w, h) {
   const MS = window.ManagedMediaSource || window.MediaSource;
-  if (!MS) { show("This browser can't play the stream.\nTry Chrome, Edge or Safari 13+ (open the page over USB for the best latency)."); return; }
+  if (!MS) { show(T.noPlayer); return; }
   const src = new MS(), queue = [initSegment(avcc, w, h)];
   video.disableRemotePlayback = true;
   video.src = URL.createObjectURL(src);
@@ -162,7 +184,7 @@ function connect() {
   ws.binaryType = "arraybuffer";
   // back-off resets only once frames flow: a server that accepts and then
   // fails must not be hammered every 500ms
-  ws.onopen = () => { show("waiting for the first frame…"); ws.send(`h ${w} ${h} ${devicePixelRatio} ${clientId} ${label}`); };
+  ws.onopen = () => { show(T.waiting); ws.send(`h ${w} ${h} ${devicePixelRatio} ${clientId} ${label}`); };
   ws.onmessage = ev => {
     if (typeof ev.data === "string") {
       const [kind, ...rest] = ev.data.split(" ");
@@ -189,7 +211,7 @@ function connect() {
     }
   };
   ws.onclose = () => {
-    show(lastError ? `${lastError}\n(retrying…)` : "reconnecting…");
+    show(lastError ? `${lastError}\n${T.retrying}` : T.reconnecting);
     if (mse) { try { URL.revokeObjectURL(video.src); } catch (e) {} mse = null; seq = 0; decodeTime = 0; }
     setTimeout(connect, Math.min(10000, 500 * 2 ** retry++));
   };
@@ -291,7 +313,17 @@ $("fs").onclick = () => {
   (d.requestFullscreen || d.webkitRequestFullscreen || (() => {})).call(d);
   if (navigator.wakeLock) navigator.wakeLock.request("screen").catch(() => {});
 };
-$("bar").addEventListener("pointerdown", e => e.stopPropagation());
+// tools: open on the handle (or a three-finger tap), close after a while
+const bar = $("bar");
+let closeTimer;
+function openBar() {
+  bar.classList.add("open");
+  clearTimeout(closeTimer);
+  closeTimer = setTimeout(() => bar.classList.remove("open"), 4000);
+}
+$("handle").addEventListener("click", openBar);
+bar.addEventListener("pointerdown", e => { e.stopPropagation(); if (bar.classList.contains("open")) openBar(); });
+surface.addEventListener("touchstart", e => { if (e.touches.length === 3) openBar(); }, { passive: true });
 
 connect();
 </script>
