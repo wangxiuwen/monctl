@@ -1,28 +1,17 @@
-// monctl cast — use any tablet (iPad, Android, Windows) as an extra screen.
-//
-// Zero install on the tablet: it opens a web page. Per connected tablet we
-// create a virtual display sized to its screen, grab it with CGDisplayStream
-// (frames only arrive when something changes), hardware-encode H.264 with
-// VideoToolbox in low-latency mode and push the access units over a
-// WebSocket. The page decodes with WebCodecs (secure contexts: localhost via
-// USB/adb) or Media Source Extensions (plain http on the LAN), and sends
-// touches back, which we replay as mouse/keyboard events.
-//
-// Wired: Android over USB is set up automatically with `adb reverse`.
+// macOS side of `monctl cast`: one worker process per tablet creates a
+// virtual display shaped like it (CGVirtualDisplay), captures it with
+// CGDisplayStream (frames only when something changes), hardware-encodes
+// H.264 with VideoToolbox in low-latency mode, and replays touches as
+// CGEvents.
 
-use crate::common::fail;
+use super::{avcc, sha1, Hello, Options, Packet, Screen};
 use crate::virt;
-use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-const PAGE: &str = include_str!("cast.html");
-pub const DEFAULT_PORT: u16 = 8484;
 
 type Ref = *mut c_void;
 
@@ -205,10 +194,6 @@ unsafe fn dict(pairs: &[(Ref, Ref)]) -> Ref {
 
 // ------------------------------------------------------------ encoder ----
 
-enum Packet {
-    Config { codec: String, avcc: Vec<u8>, width: u32, height: u32 },
-    Frame { key: bool, ts_us: u64, data: Vec<u8> },
-}
 
 /// One capture → encode pipeline for one display.
 struct Encoder {
@@ -284,18 +269,6 @@ unsafe fn parameter_sets(fmt: Ref) -> Option<(Vec<u8>, Vec<u8>)> {
     let sps = get(0)?;
     (sps.len() >= 4).then_some(())?;
     Some((sps, get(1)?))
-}
-
-/// AVCDecoderConfigurationRecord: what both WebCodecs (`description`) and
-/// an MP4 `avcC` box want. Our access units use 4-byte NAL length prefixes.
-fn avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
-    let mut v = vec![1, sps[1], sps[2], sps[3], 0xFF, 0xE1];
-    v.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    v.extend_from_slice(sps);
-    v.push(1);
-    v.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    v.extend_from_slice(pps);
-    v
 }
 
 unsafe extern "C" fn on_frame(block: *const StreamBlock, status: i32, time: u64, surface: Ref, _update: Ref) {
@@ -581,174 +554,51 @@ fn input_allowed(prompt: bool) -> bool {
     }
 }
 
-// ---------------------------------------------------------- websocket ----
 
-fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
-    let mut msg = data.to_vec();
-    let bits = (data.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+// --------------------------------------------------------- platform API ----
+
+pub(super) fn prepare(_opts: &Options) {
+    if !input_allowed(true) {
+        println!("note: touch input needs Accessibility permission for this terminal (System Settings → Privacy & Security → Accessibility); showing the screen works without it");
     }
-    msg.extend_from_slice(&bits.to_be_bytes());
-    for block in msg.chunks(64) {
-        let mut w = [0u32; 80];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e] = h;
-        for (i, wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | (!b & d), 0x5A827999),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-                _ => (b ^ c ^ d, 0xCA62C1D6),
-            };
-            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = t;
-        }
-        for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
-            *x = x.wrapping_add(y);
-        }
-    }
-    let mut out = [0u8; 20];
-    for (i, x) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&x.to_be_bytes());
-    }
-    out
 }
 
-pub fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            if i <= c.len() {
-                s.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                s.push('=');
-            }
-        }
+pub(super) fn resolve_display(token: &str) -> Result<String, String> {
+    if token == "main" {
+        return Ok(crate::macos::main_id());
     }
-    s
+    token.parse::<u32>().map(|d| d.to_string()).map_err(|_| format!("bad --display id '{token}'"))
 }
 
-fn ws_send(out: &mut impl Write, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
-    let mut head = vec![0x80 | opcode];
-    match payload.len() {
-        n if n < 126 => head.push(n as u8),
-        n if n < 65536 => {
-            head.push(126);
-            head.extend_from_slice(&(n as u16).to_be_bytes());
-        }
-        n => {
-            head.push(127);
-            head.extend_from_slice(&(n as u64).to_be_bytes());
-        }
+/// The server hands each tablet's socket to its own worker process.
+pub(super) fn dispatch(sock: TcpStream, opts: &Options) {
+    if let Err(e) = spawn_worker(&sock, opts) {
+        eprintln!("monctl cast: cannot start a session: {e}");
     }
-    out.write_all(&head)?;
-    out.write_all(payload)
 }
 
-/// Next client message: Some((opcode, payload)); None when the socket closed.
-fn ws_read(r: &mut impl Read) -> Option<(u8, Vec<u8>)> {
-    let mut h = [0u8; 2];
-    r.read_exact(&mut h).ok()?;
-    let opcode = h[0] & 0x0F;
-    let masked = h[1] & 0x80 != 0;
-    let mut len = (h[1] & 0x7F) as u64;
-    if len == 126 {
-        let mut b = [0u8; 2];
-        r.read_exact(&mut b).ok()?;
-        len = u16::from_be_bytes(b) as u64;
-    } else if len == 127 {
-        let mut b = [0u8; 8];
-        r.read_exact(&mut b).ok()?;
-        len = u64::from_be_bytes(b);
+/// `monctl cast --worker`: run one session on the socket handed over as fd 3.
+pub(super) fn worker(opts: &Options) -> ! {
+    use std::os::fd::FromRawFd;
+    // stopping `monctl cast` (Ctrl+C, the tray's "stop") must take every
+    // tablet screen with it: a worker whose server is gone ends itself
+    extern "C" {
+        fn getppid() -> i32;
     }
-    if len > 1 << 20 {
-        return None; // the page only ever sends short control lines
-    }
-    let mut mask = [0u8; 4];
-    if masked {
-        r.read_exact(&mut mask).ok()?;
-    }
-    let mut payload = vec![0u8; len as usize];
-    r.read_exact(&mut payload).ok()?;
-    if masked {
-        for (i, b) in payload.iter_mut().enumerate() {
-            *b ^= mask[i % 4];
+    let parent = unsafe { getppid() };
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(500));
+        if unsafe { getppid() } != parent {
+            std::process::exit(0);
         }
-    }
-    Some((opcode, payload))
+    });
+    super::session(unsafe { TcpStream::from_raw_fd(3) }, opts);
+    std::process::exit(0)
 }
 
-// -------------------------------------------------------------- server ----
-
-pub struct Options {
-    pub port: u16,
-    /// stream an existing display instead of creating one per tablet
-    pub display: Option<u32>,
-    pub bitrate_mbps: u32,
-    pub hidpi: bool,
-}
-
-/// Stable serial per tablet: macOS remembers arrangement per (vendor,
-/// product, serial), so the same tablet lands in the same spot every time.
 fn serial_for(client: &str) -> u32 {
     let h = sha1(client.as_bytes());
     0x1000 + (u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 0xE000)
-}
-
-fn handle(mut sock: TcpStream, opts: &Options) {
-    let _ = sock.set_nodelay(true);
-    let mut reader = BufReader::new(match sock.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    });
-    let mut request = String::new();
-    if reader.read_line(&mut request).is_err() {
-        return;
-    }
-    let mut headers = HashMap::new();
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-        }
-    }
-    let path = request.split_whitespace().nth(1).unwrap_or("/");
-    if path.starts_with("/ws") {
-        let Some(key) = headers.get("sec-websocket-key") else { return };
-        let accept = base64(&sha1(format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes()));
-        let _ = write!(sock, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
-        // nothing past the headers can be buffered yet: the page only talks
-        // after it has seen our 101
-        drop(reader);
-        if let Err(e) = spawn_worker(&sock, opts) {
-            eprintln!("monctl cast: cannot start a session: {e}");
-        }
-    } else if path == "/" || path.starts_with("/?") || path == "/index.html" {
-        let _ = write!(
-            sock,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{PAGE}",
-            PAGE.len()
-        );
-    } else {
-        let _ = write!(sock, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-    }
 }
 
 /// One process per tablet session. A process that connected to the
@@ -768,8 +618,8 @@ fn spawn_worker(sock: &TcpStream, opts: &Options) -> std::io::Result<()> {
     let fd = sock.as_raw_fd();
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.args(["cast", "--worker", "--bitrate", &opts.bitrate_mbps.to_string()]);
-    if let Some(d) = opts.display {
-        cmd.args(["--display", &d.to_string()]);
+    if let Some(d) = &opts.display {
+        cmd.args(["--display", d]);
     }
     if !opts.hidpi {
         cmd.arg("--no-hidpi");
@@ -790,265 +640,60 @@ fn spawn_worker(sock: &TcpStream, opts: &Options) -> std::io::Result<()> {
     Ok(())
 }
 
-fn session(sock: TcpStream, opts: &Options) {
-    let _ = sock.set_nodelay(true);
-    let mut reader = match sock.try_clone() {
-        Ok(s) => BufReader::new(s),
-        Err(_) => return,
-    };
-    let peer = sock.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-    // first message: "h <css width> <css height> <devicePixelRatio> <client id> <label...>"
-    let hello = match ws_read(&mut reader) {
-        Some((1, p)) => String::from_utf8_lossy(&p).to_string(),
-        _ => return,
-    };
-    let f: Vec<&str> = hello.splitn(6, ' ').collect();
-    if f.first() != Some(&"h") || f.len() < 5 {
-        return;
-    }
-    let num = |i: usize| f.get(i).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-    let (cw, ch, dpr) = (num(1).round() as u32, num(2).round() as u32, num(3));
-    let client = f[4].to_string();
-    let label = f.get(5).copied().unwrap_or("tablet").to_string();
-    let fail_session = |e: &str| {
-        eprintln!("monctl cast: {label}: {e}");
-        let mut s = &sock;
-        let _ = ws_send(&mut s, 1, format!("err {e}").as_bytes());
-    };
 
-    // stream an existing display, or create one shaped like the tablet
+struct MacScreen {
+    capture: Option<Capture>,
+    input: Input,
+    can_input: bool,
+    display: u32,
+    owned: Option<virt::Id>,
+}
+
+impl Screen for MacScreen {
+    fn display(&self) -> String {
+        self.display.to_string()
+    }
+    fn request_keyframe(&self) {
+        if let Some(c) = &self.capture {
+            c.request_keyframe();
+        }
+    }
+    fn input(&mut self, msg: &str) {
+        if self.can_input {
+            self.input.handle(msg);
+        }
+    }
+}
+
+impl Drop for MacScreen {
+    fn drop(&mut self) {
+        self.capture.take(); // stop capturing before the display goes away
+        if let Some(d) = self.owned.take() {
+            unsafe { virt::release(d) };
+        }
+    }
+}
+
+/// Stream an existing display, or create one shaped like the tablet.
+pub(super) fn open(hello: &Hello, opts: &Options, tx: SyncSender<Packet>) -> Result<Box<dyn Screen>, String> {
     let mut owned = None;
-    let display = match opts.display {
-        Some(d) => d,
+    let display = match &opts.display {
+        Some(d) => d.parse().map_err(|_| format!("bad display id {d}"))?,
         None => {
-            let hidpi = opts.hidpi && dpr >= 1.5;
-            let spec = virt::Spec { width: cw.clamp(640, 4096) & !1, height: ch.clamp(480, 4096) & !1, hz: 60, hidpi };
-            match unsafe { virt::create(&spec, serial_for(&client), &label) } {
-                Ok((d, id)) => {
-                    owned = Some(d);
-                    id
-                }
-                Err(e) => return fail_session(&format!("cannot create a screen: {e}")),
-            }
+            let hidpi = opts.hidpi && hello.dpr >= 1.5;
+            let spec = virt::Spec { width: hello.width.clamp(640, 4096) & !1, height: hello.height.clamp(480, 4096) & !1, hz: 60, hidpi };
+            let (d, id) = unsafe { virt::create(&spec, serial_for(&hello.client), &hello.label) }.map_err(|e| format!("cannot create a screen: {e}"))?;
+            owned = Some(d);
+            id
         }
     };
-    println!("+ {label} ({peer}, {cw}x{ch} @{dpr}x) -> display {display}");
-
-    let (tx, rx) = sync_channel::<Packet>(8);
-    let capture = match Capture::start(display, opts.bitrate_mbps, tx) {
-        Ok(c) => c,
-        Err(e) => return fail_session(&e),
+    let mut screen = MacScreen {
+        capture: None,
+        input: Input { display, left_down: false, last_click: std::time::Instant::now() - Duration::from_secs(1), clicks: 0 },
+        can_input: input_allowed(false),
+        display,
+        owned,
     };
-    let writer = {
-        let mut out = match sock.try_clone() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        std::thread::spawn(move || writer_loop(&mut out, rx))
-    };
-
-    let mut input = Input { display, left_down: false, last_click: std::time::Instant::now() - Duration::from_secs(1), clicks: 0 };
-    let can_input = input_allowed(false);
-    while let Some((op, payload)) = ws_read(&mut reader) {
-        match op {
-            1 => {
-                let msg = String::from_utf8_lossy(&payload);
-                if msg == "key" {
-                    capture.request_keyframe();
-                } else if can_input {
-                    input.handle(&msg);
-                }
-            }
-            8 => break,
-            9 => {
-                let mut s = &sock;
-                let _ = ws_send(&mut s, 10, &payload);
-            }
-            _ => {}
-        }
-    }
-    drop(capture); // stops capture; the writer sees the channel close
-    let _ = writer.join();
-    let _ = sock.shutdown(std::net::Shutdown::Both);
-    if let Some(d) = owned {
-        unsafe { virt::release(d) };
-    }
-    println!("- {label} disconnected");
-}
-
-fn writer_loop(out: &mut TcpStream, rx: Receiver<Packet>) {
-    for p in rx {
-        let r = match p {
-            Packet::Config { codec, avcc, width, height } => ws_send(out, 1, format!("cfg {codec} {width} {height} {}", base64(&avcc)).as_bytes()),
-            Packet::Frame { key, ts_us, data } => {
-                let mut buf = Vec::with_capacity(data.len() + 9);
-                buf.push(key as u8);
-                buf.extend_from_slice(&ts_us.to_be_bytes());
-                buf.extend_from_slice(&data);
-                ws_send(out, 2, &buf)
-            }
-        };
-        if r.is_err() {
-            break;
-        }
-    }
-}
-
-// ---------------------------------------------------- connection help ----
-
-/// LAN IPv4 addresses worth printing (no loopback / link-local).
-fn lan_addresses() -> Vec<String> {
-    #[repr(C)]
-    struct IfAddrs {
-        next: *mut IfAddrs,
-        name: *const c_char,
-        flags: u32,
-        addr: *const SockAddrIn,
-        netmask: *const c_void,
-        dst: *const c_void,
-        data: *const c_void,
-    }
-    #[repr(C)]
-    struct SockAddrIn {
-        len: u8,
-        family: u8,
-        port: u16,
-        addr: [u8; 4],
-    }
-    extern "C" {
-        fn getifaddrs(out: *mut *mut IfAddrs) -> i32;
-        fn freeifaddrs(p: *mut IfAddrs);
-    }
-    let mut out = vec![];
-    unsafe {
-        let mut head: *mut IfAddrs = std::ptr::null_mut();
-        if getifaddrs(&mut head) != 0 {
-            return out;
-        }
-        let mut p = head;
-        while !p.is_null() {
-            let a = (*p).addr;
-            if !a.is_null() && (*a).family == 2 {
-                let ip = (*a).addr;
-                let name = std::ffi::CStr::from_ptr((*p).name).to_string_lossy();
-                // skip loopback, link-local and VPN tunnels (utun) nobody can reach
-                if ip[0] != 127 && !(ip[0] == 169 && ip[1] == 254) && !name.starts_with("utun") {
-                    let s = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-                    if !out.contains(&s) {
-                        out.push(s);
-                    }
-                }
-            }
-            p = (*p).next;
-        }
-        freeifaddrs(head);
-    }
-    out
-}
-
-/// Android over USB: tunnel the port with `adb reverse` and open the page on
-/// the tablet - plug in, run `monctl cast`, done. localhost is a secure
-/// context, so the tablet also gets the lowest-latency (WebCodecs) decoder.
-fn wire_android(port: u16) {
-    let Ok(out) = std::process::Command::new("adb").arg("devices").output() else { return };
-    let serials: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .skip(1)
-        .filter_map(|l| l.strip_suffix("\tdevice").map(str::to_string))
-        .collect();
-    for s in serials {
-        let tcp = format!("tcp:{port}");
-        let ok = std::process::Command::new("adb").args(["-s", &s, "reverse", &tcp, &tcp]).output().is_ok_and(|o| o.status.success());
-        if ok {
-            let url = format!("http://localhost:{port}/");
-            let _ = std::process::Command::new("adb")
-                .args(["-s", &s, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", &url])
-                .output();
-            println!("USB  Android {s}: wired via adb, opened {url} on the tablet");
-        }
-    }
-}
-
-pub fn serve(opts: Options) -> ! {
-    let listener = TcpListener::bind(("0.0.0.0", opts.port)).unwrap_or_else(|e| fail(&format!("cannot listen on port {}: {e}", opts.port)));
-    if !input_allowed(true) {
-        println!("note: touch input needs Accessibility permission for this terminal (System Settings → Privacy & Security → Accessibility); showing the screen works without it");
-    }
-    let addrs = lan_addresses();
-    println!("monctl cast - open on the tablet (same Wi-Fi):");
-    for a in &addrs {
-        println!("  http://{a}:{}/", opts.port);
-    }
-    if let Some(a) = addrs.first() {
-        print!("{}", crate::qr::terminal(&format!("http://{a}:{}/", opts.port)));
-    }
-    wire_android(opts.port);
-    println!("each tablet gets its own screen; Ctrl+C stops casting");
-    let opts = Arc::new(opts);
-    for sock in listener.incoming().flatten() {
-        let o = opts.clone();
-        std::thread::spawn(move || handle(sock, &o));
-    }
-    std::process::exit(0)
-}
-
-pub fn run(args: &[String]) -> ! {
-    let mut opts = Options { port: DEFAULT_PORT, display: None, bitrate_mbps: 12, hidpi: true };
-    let worker = args.first().map(|s| s.as_str()) == Some("--worker");
-    let mut it = args.iter().skip(worker as usize);
-    while let Some(a) = it.next() {
-        let mut val = || it.next().cloned().unwrap_or_else(|| fail(&format!("{a} needs a value")));
-        match a.as_str() {
-            "--port" | "-p" => opts.port = val().parse().unwrap_or_else(|_| fail("bad --port")),
-            "--display" | "--mirror" => {
-                let v = val();
-                opts.display = Some(if v == "main" { crate::macos::main_id().parse().unwrap() } else { v.parse().unwrap_or_else(|_| fail("bad --display id")) });
-            }
-            "--bitrate" => opts.bitrate_mbps = val().trim_end_matches("M").parse().unwrap_or_else(|_| fail("bad --bitrate (Mbit/s)")),
-            "--no-hidpi" | "--lodpi" => opts.hidpi = false,
-            _ => fail("usage: monctl cast [--port N] [--display ID|main] [--bitrate MBPS] [--no-hidpi]"),
-        }
-    }
-    if worker {
-        use std::os::fd::FromRawFd;
-        // stopping `monctl cast` (Ctrl+C, the tray's "stop") must take every
-        // tablet screen with it: a worker whose server is gone ends itself
-        extern "C" {
-            fn getppid() -> i32;
-        }
-        let parent = unsafe { getppid() };
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(500));
-            if unsafe { getppid() } != parent {
-                std::process::exit(0);
-            }
-        });
-        session(unsafe { TcpStream::from_raw_fd(3) }, &opts);
-        std::process::exit(0);
-    }
-    serve(opts)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sha1_and_base64_match_the_websocket_rfc_example() {
-        // RFC 6455 section 1.3
-        let accept = base64(&sha1(b"dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
-        assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
-        assert_eq!(base64(b"ab"), "YWI=");
-        assert_eq!(base64(b"a"), "YQ==");
-    }
-
-    #[test]
-    fn avcc_record() {
-        let sps = [0x67, 0x4d, 0x00, 0x28, 0xaa];
-        let pps = [0x68, 0xee];
-        let r = avcc(&sps, &pps);
-        assert_eq!(&r[..6], &[1, 0x4d, 0x00, 0x28, 0xFF, 0xE1]);
-        assert_eq!(&r[6..8], &[0, 5]);
-        assert_eq!(&r[13..16], &[1, 0, 2]);
-    }
+    screen.capture = Some(Capture::start(display, opts.bitrate_mbps, tx)?); // on error the drop releases the display
+    Ok(Box::new(screen))
 }

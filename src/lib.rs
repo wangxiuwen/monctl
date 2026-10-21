@@ -14,3 +14,5 @@ pub mod qr;
 pub mod virt;
 #[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "windows")]
+pub mod winvdd;

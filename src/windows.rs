@@ -166,6 +166,16 @@ fn adapters() -> Vec<(String, String, DWORD)> {
     out
 }
 
+/// `\\.\DISPLAYn` of the desktop-attached outputs of adapters described as
+/// `name` (e.g. a virtual display driver's), in enumeration order.
+pub fn adapters_named(name: &str) -> Vec<String> {
+    adapters()
+        .into_iter()
+        .filter(|(_, desc, flags)| desc == name && flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0)
+        .map(|(dev, _, _)| dev)
+        .collect()
+}
+
 fn current_settings(device: &str) -> Option<DEVMODEW> {
     let wide = string_to_wide(device);
     let mut dm = DEVMODEW::new();

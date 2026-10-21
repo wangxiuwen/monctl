@@ -13,7 +13,7 @@ use std::ffi::{c_char, c_void, CString};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-type Id = *mut c_void;
+pub type Id = *mut c_void;
 type Sel = *mut c_void;
 
 #[link(name = "objc")]

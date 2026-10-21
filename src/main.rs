@@ -255,7 +255,7 @@ fn cmd_hidpi(token: Option<&str>, extra: Option<&str>, displays: &[DisplayInfo])
 /// What `list` shows: displays in use, plus ones monctl turned off. Idle GPU
 /// heads and the outputs of virtual adapters other apps install (Windows
 /// lists every one of them as a display) are noise unless asked for (--all).
-fn listed<'a>(displays: &'a [DisplayInfo], all: bool) -> Vec<&'a DisplayInfo> {
+fn listed(displays: &[DisplayInfo], all: bool) -> Vec<&DisplayInfo> {
     let state = common::load_state();
     displays.iter().filter(|d| all || d.active || d.mirror_of.is_some() || state.contains_key(&d.id)).collect()
 }
@@ -376,6 +376,8 @@ fn main() {
         "cast" | "tablet" => monctl::cast::run(&args[1..]),
         #[cfg(not(target_os = "macos"))]
         "cast" | "tablet" => fail("casting to a tablet is macOS-only for now"),
+        #[cfg(windows)]
+        "driver" => monctl::winvdd::run_cli(&args[1..]),
         #[cfg(not(target_os = "macos"))]
         "virtual" | "virt" => fail("virtual displays are macOS-only for now (Windows needs an indirect display driver)"),
         _ => {}
