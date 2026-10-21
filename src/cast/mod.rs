@@ -207,8 +207,12 @@ pub(crate) fn ws_read(r: &mut impl Read) -> Option<(u8, Vec<u8>)> {
 
 
 /// Annex-B (start codes) → AVCC (4-byte lengths), pulling SPS/PPS out.
+/// AVCC data (4-byte NAL lengths), the SPS/PPS it carried, keyframe or not.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) type AccessUnit = (Vec<u8>, Option<(Vec<u8>, Vec<u8>)>, bool);
+
 #[cfg_attr(target_os = "macos", allow(dead_code))] // VideoToolbox hands out AVCC already
-pub(crate) fn annexb_to_avcc(data: &[u8]) -> (Vec<u8>, Option<(Vec<u8>, Vec<u8>)>, bool) {
+pub(crate) fn annexb_to_avcc(data: &[u8]) -> AccessUnit {
     let mut nals = vec![];
     let mut i = 0;
     let mut start = None;
