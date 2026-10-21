@@ -12,8 +12,9 @@ tray app). macOS / Windows / Linux.
   as Retina.
 - **Virtual displays** (macOS) — any size, HiDPI, for headless Macs and
   screen sharing.
-- **Any tablet as an extra screen** (macOS or Windows → iPad / Android /
-  Windows tablets) — over Wi-Fi or USB, nothing to install on the tablet.
+- **Any tablet as an extra screen** (macOS, Windows or Linux/X11 → iPad /
+  Android / Windows tablets) — over Wi-Fi or USB, nothing to install on the
+  tablet; it gets its screen back after a drop.
 - **Keep awake** / sleep now.
 
 ```console
@@ -64,7 +65,7 @@ monctl main ID               make a display the main one (menu bar, Dock / taskb
 monctl mirror ID [SOURCE]    show SOURCE (default: main) on display ID; `mirror off` undoes
 monctl hidpi [ID] | off [ID] macOS: crisp HiDPI rendering on any monitor
 monctl virtual [add [WxH[@Hz]] [--name N] [--no-hidpi] | rm ID|all]   macOS
-monctl cast [--port N] [--display ID|main] [--bitrate MBPS]          macOS, Windows
+monctl cast [--port N] [--display ID|main] [--bitrate MBPS]          macOS, Windows, Linux (X11)
 monctl driver [status|install|uninstall|restart]                     Windows: cast's screen driver
 monctl sidecar [NAME|off]                                            macOS: iPad via Apple's Sidecar
 
@@ -144,7 +145,7 @@ record it, set its resolution with `monctl mode`. Useful on headless Macs
 (remote desktop at any resolution) and as a private screen during screen
 sharing. Each one is owned by a tiny holder process; it disappears with it.
 
-## Tablets as extra screens (macOS, Windows)
+## Tablets as extra screens (macOS, Windows, Linux)
 
 ```console
 $ monctl cast
@@ -192,6 +193,19 @@ and scale (an iPad at 2x gets 200%), and hands it back when it leaves.
 - Capture: DXGI Desktop Duplication; encode: Media Foundation H.264 on the
   GPU (NVENC / Quick Sync / AMF), software fallback.
 - Up to 4 tablets at a time.
+
+**On Linux** (an X11 session) the tablet's screen is a RandR monitor added
+next to the desktop; `ffmpeg` (x11grab + libx264, zero-latency) captures
+and encodes it, XTest replays touch. Needs `xrandr`, `ffmpeg`, `libxtst6`
+(and `xdotool` for typing): `sudo apt install x11-xserver-utils ffmpeg
+libxtst6 xdotool`. X11 has no per-monitor scaling, so the screen is the
+tablet's CSS size (normal UI size). Wayland can't add screens from outside
+the compositor - use an X11 session.
+
+**Drop-outs**: a tablet that sleeps, reloads or hops Wi-Fi gets *its*
+screen back - with its windows still on it - for 60 s after it left; the
+newest connection of a tablet always wins, so a half-open old one never
+blocks it.
 
 ## iPad over USB: Sidecar (macOS)
 
@@ -272,7 +286,8 @@ Feature support:
 | mode / main | ✓ (incl. HiDPI modes) | ✓ | ✓ |
 | mirror | ✓ | Win+P | ✓ X11 |
 | hidpi, virtual | ✓ | – | – |
-| cast (tablets) | ✓ | ✓ (bundled driver) | – |
+| cast (tablets) | ✓ | ✓ (bundled driver) | ✓ X11 (ffmpeg) |
+| iPad over USB | ✓ Sidecar | – | – |
 | awake / sleep | ✓ | ✓ | ✓ |
 | tray app | ✓ | ✓ | – |
 

@@ -376,10 +376,7 @@ fn main() {
         "sleep" => awake::sleep_now(),
         #[cfg(target_os = "macos")]
         "virtual" | "virt" => monctl::virt::run(&args[1..]),
-        #[cfg(any(target_os = "macos", windows))]
         "cast" | "tablet" => monctl::cast::run(&args[1..]),
-        #[cfg(not(any(target_os = "macos", windows)))]
-        "cast" | "tablet" => fail("casting to a tablet needs macOS or Windows for now"),
         #[cfg(windows)]
         "driver" => monctl::winvdd::run_cli(&args[1..]),
         #[cfg(target_os = "macos")]

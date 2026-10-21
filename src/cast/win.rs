@@ -10,7 +10,7 @@
 // All COM is called through hand-written vtables (indices checked against
 // the SDK/Wine IDL); the crate stays dependency-free.
 
-use super::{avcc, Hello, Options, Packet, Screen};
+use super::{annexb_to_avcc, avcc, Hello, Options, Packet, Screen};
 use crate::winvdd;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -638,54 +638,6 @@ impl Encoder {
     }
 }
 
-/// Annex-B (start codes) → AVCC (4-byte lengths), pulling SPS/PPS out.
-fn annexb_to_avcc(data: &[u8]) -> (Vec<u8>, Option<(Vec<u8>, Vec<u8>)>, bool) {
-    let mut nals = vec![];
-    let mut i = 0;
-    let mut start = None;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && (data[i + 2] == 1 || (data[i + 2] == 0 && i + 3 < data.len() && data[i + 3] == 1)) {
-            let sc = if data[i + 2] == 1 { 3 } else { 4 };
-            if let Some(s) = start {
-                nals.push(&data[s..i]);
-            }
-            start = Some(i + sc);
-            i += sc;
-        } else {
-            i += 1;
-        }
-    }
-    if let Some(s) = start {
-        nals.push(&data[s..]);
-    }
-    let (mut sps, mut pps, mut key) = (None, None, false);
-    let mut out = Vec::with_capacity(data.len() + 16);
-    for n in nals {
-        let n = {
-            // trailing zero bytes belong to the next start code
-            let mut end = n.len();
-            while end > 1 && n[end - 1] == 0 {
-                end -= 1;
-            }
-            &n[..end]
-        };
-        if n.is_empty() {
-            continue;
-        }
-        match n[0] & 0x1f {
-            7 => sps = Some(n.to_vec()),
-            8 => pps = Some(n.to_vec()),
-            9 => {} // access unit delimiter: noise for the page
-            t => {
-                key |= t == 5;
-                out.extend_from_slice(&(n.len() as u32).to_be_bytes());
-                out.extend_from_slice(n);
-            }
-        }
-    }
-    (out, sps.zip(pps), key)
-}
-
 /// Hands encoded access units to the WebSocket writer.
 struct Out {
     tx: SyncSender<Packet>,
@@ -1202,15 +1154,6 @@ fn open(hello: &Hello, opts: &Options, tx: SyncSender<Packet>) -> Result<Box<dyn
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn annexb_split() {
-        let data = [0, 0, 0, 1, 0x67, 0x4d, 0, 0x28, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 1, 2, 3];
-        let (avcc_data, params, key) = annexb_to_avcc(&data);
-        assert!(key);
-        assert_eq!(params, Some((vec![0x67, 0x4d, 0, 0x28], vec![0x68, 0xee])));
-        assert_eq!(avcc_data, vec![0, 0, 0, 4, 0x65, 1, 2, 3]);
-    }
 
     #[test]
     fn nv12_grey() {

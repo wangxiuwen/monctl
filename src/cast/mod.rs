@@ -30,6 +30,10 @@ use mac as platform;
 mod win;
 #[cfg(windows)]
 use win as platform;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as platform;
 
 const PAGE: &str = include_str!("page.html");
 const HOST_PAGE: &str = include_str!("host.html");
@@ -50,7 +54,7 @@ pub(crate) enum Packet {
 #[derive(Clone)]
 pub(crate) struct Hello {
     /// the line as sent, to hand on to the worker serving the tablet (macOS)
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub raw: String,
     pub width: u32,
     pub height: u32,
@@ -201,6 +205,55 @@ pub(crate) fn ws_read(r: &mut impl Read) -> Option<(u8, Vec<u8>)> {
     Some((opcode, payload))
 }
 
+
+/// Annex-B (start codes) → AVCC (4-byte lengths), pulling SPS/PPS out.
+#[cfg_attr(target_os = "macos", allow(dead_code))] // VideoToolbox hands out AVCC already
+pub(crate) fn annexb_to_avcc(data: &[u8]) -> (Vec<u8>, Option<(Vec<u8>, Vec<u8>)>, bool) {
+    let mut nals = vec![];
+    let mut i = 0;
+    let mut start = None;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && (data[i + 2] == 1 || (data[i + 2] == 0 && i + 3 < data.len() && data[i + 3] == 1)) {
+            let sc = if data[i + 2] == 1 { 3 } else { 4 };
+            if let Some(s) = start {
+                nals.push(&data[s..i]);
+            }
+            start = Some(i + sc);
+            i += sc;
+        } else {
+            i += 1;
+        }
+    }
+    if let Some(s) = start {
+        nals.push(&data[s..]);
+    }
+    let (mut sps, mut pps, mut key) = (None, None, false);
+    let mut out = Vec::with_capacity(data.len() + 16);
+    for n in nals {
+        let n = {
+            // trailing zero bytes belong to the next start code
+            let mut end = n.len();
+            while end > 1 && n[end - 1] == 0 {
+                end -= 1;
+            }
+            &n[..end]
+        };
+        if n.is_empty() {
+            continue;
+        }
+        match n[0] & 0x1f {
+            7 => sps = Some(n.to_vec()),
+            8 => pps = Some(n.to_vec()),
+            9 => {} // access unit delimiter: noise for the page
+            t => {
+                key |= t == 5;
+                out.extend_from_slice(&(n.len() as u32).to_be_bytes());
+                out.extend_from_slice(n);
+            }
+        }
+    }
+    (out, sps.zip(pps), key)
+}
 
 // -------------------------------------------------------------- server ----
 
@@ -379,10 +432,19 @@ fn lan_addresses() -> Vec<String> {
         dst: *const c_void,
         data: *const c_void,
     }
+    // BSD/macOS: {u8 len, u8 family}; Linux: {u16 family}
+    #[cfg(not(target_os = "linux"))]
     #[repr(C)]
     struct SockAddrIn {
         len: u8,
         family: u8,
+        port: u16,
+        addr: [u8; 4],
+    }
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    struct SockAddrIn {
+        family: u16,
         port: u16,
         addr: [u8; 4],
     }
@@ -399,11 +461,12 @@ fn lan_addresses() -> Vec<String> {
         let mut p = head;
         while !p.is_null() {
             let a = (*p).addr;
-            if !a.is_null() && (*a).family == 2 {
+            if !a.is_null() && (*a).family as u32 == 2 {
                 let ip = (*a).addr;
                 let name = std::ffi::CStr::from_ptr((*p).name).to_string_lossy();
-                // skip loopback, link-local and VPN tunnels (utun) nobody can reach
-                if ip[0] != 127 && !(ip[0] == 169 && ip[1] == 254) && !name.starts_with("utun") {
+                // skip loopback, link-local, VPN tunnels and container bridges nobody can reach
+                let internal = ["utun", "docker", "br-", "veth", "virbr"].iter().any(|p| name.starts_with(p));
+                if ip[0] != 127 && !(ip[0] == 169 && ip[1] == 254) && !internal {
                     let s = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
                     if !out.contains(&s) {
                         out.push(s);
@@ -507,6 +570,15 @@ mod tests {
         assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
         assert_eq!(base64(b"ab"), "YWI=");
         assert_eq!(base64(b"a"), "YQ==");
+    }
+
+    #[test]
+    fn annexb_split() {
+        let data = [0, 0, 0, 1, 0x67, 0x4d, 0, 0x28, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 1, 2, 3];
+        let (avcc_data, params, key) = annexb_to_avcc(&data);
+        assert!(key);
+        assert_eq!(params, Some((vec![0x67, 0x4d, 0, 0x28], vec![0x68, 0xee])));
+        assert_eq!(avcc_data, vec![0, 0, 0, 4, 0x65, 1, 2, 3]);
     }
 
     #[test]

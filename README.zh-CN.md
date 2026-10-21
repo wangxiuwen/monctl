@@ -8,7 +8,7 @@
 - **分辨率**（包括系统设置里藏起来的 HiDPI 模式）、**设主屏**、**镜像**，一条命令搞定。
 - **任意显示器开 HiDPI**（macOS）——非 Retina 外接屏也能显示锐利的文字。
 - **虚拟显示器**（macOS）——任意尺寸，支持 HiDPI，适合无头 Mac 和屏幕共享。
-- **平板当副屏**（macOS 或 Windows → iPad / 安卓 / Windows 平板）——无线、有线都行，平板上什么都不用装。
+- **平板当副屏**（macOS、Windows 或 Linux/X11 → iPad / 安卓 / Windows 平板）——无线、有线都行，平板上什么都不用装；断线回来还是原来那块屏。
 - **防休眠** / 立即休眠。
 
 ```console
@@ -58,7 +58,7 @@ monctl main ID               设为主屏（菜单栏、Dock / 任务栏跟过�
 monctl mirror ID [源]        让 ID 显示「源」的画面（默认主屏）；mirror off 取消
 monctl hidpi [ID] | off [ID] macOS：任意显示器开 HiDPI
 monctl virtual [add [WxH[@Hz]] [--name 名字] [--no-hidpi] | rm ID|all]   macOS 虚拟显示器
-monctl cast [--port 端口] [--display ID|main] [--bitrate Mbps]           平板当副屏（macOS、Windows）
+monctl cast [--port 端口] [--display ID|main] [--bitrate Mbps]           平板当副屏（macOS、Windows、Linux/X11）
 monctl driver [status|install|uninstall|restart]                        Windows：投屏用的屏幕驱动
 monctl sidecar [名字|off]                                               macOS：用苹果随航把 iPad 当屏幕
 
@@ -125,7 +125,7 @@ $ monctl virtual rm 8                   # 或 rm all
 `monctl mode` 改分辨率。适合无头 Mac（任意分辨率远程桌面），或者屏幕共享时
 放一块「私人屏」。每块虚拟屏挂在一个小 holder 进程上，进程没了屏也就没了。
 
-## 平板当副屏（macOS、Windows）
+## 平板当副屏（macOS、Windows、Linux）
 
 ```console
 $ monctl cast
@@ -160,6 +160,14 @@ USB  Android R58N...: wired via adb, opened http://localhost:8484/ on the tablet
 
 - 抓屏：DXGI 桌面复制；编码：GPU 上的 Media Foundation H.264（NVENC / Quick Sync / AMF），没有则用软件编码。
 - 最多同时 4 台平板。
+
+**Linux 上**（X11 会话）平板的屏是在桌面旁边新增的一个 RandR 显示器；`ffmpeg`（x11grab + libx264 零延迟）负责抓屏编码，
+XTest 回传触控。需要 `xrandr`、`ffmpeg`、`libxtst6`（打字还要 `xdotool`）：
+`sudo apt install x11-xserver-utils ffmpeg libxtst6 xdotool`。X11 没有按显示器缩放，所以按平板的逻辑尺寸建屏（界面大小正常）。
+Wayland 不允许外部程序新增屏幕，请用 X11 会话。
+
+**断线**：平板休眠、刷新页面或切换 Wi-Fi，离开后 60 秒内回来还是**它自己那块屏**，窗口都还在；同一台平板总是新连接优先，
+断网留下的半开旧连接不会挡住它。
 
 ## iPad 有线：随航（macOS）
 
@@ -221,7 +229,8 @@ macOS 上的保持同时包含 `PreventSystemSleep`（即 `caffeinate -s` 的效
 | 分辨率 / 主屏 | ✓（含 HiDPI 模式） | ✓ | ✓ |
 | 镜像 | ✓ | Win+P | ✓ X11 |
 | hidpi、虚拟显示器 | ✓ | – | – |
-| 平板投屏 | ✓ | ✓（内置驱动） | – |
+| 平板投屏 | ✓ | ✓（内置驱动） | ✓ X11（ffmpeg） |
+| iPad 有线 | ✓ 随航 | – | – |
 | 防休眠 / 休眠 | ✓ | ✓ | ✓ |
 | 托盘应用 | ✓ | ✓ | – |
 
