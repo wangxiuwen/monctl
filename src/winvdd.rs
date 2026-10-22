@@ -17,7 +17,7 @@
 // until a tablet claims one. Settings live in monctl's own directory
 // (VDDPATH), not shared with other VDD installs.
 
-use crate::common::fail;
+use crate::common::{fail, load_state, save_state};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -556,6 +556,16 @@ pub fn displays() -> Vec<String> {
 pub fn park() {
     for d in displays() {
         let _ = crate::windows::set_enabled(&d, false);
+    }
+    // an off/solo that swept the pool while it was briefly on the desktop
+    // recorded its monitors as user-turned-off screens; unrecord them, the
+    // pool recovers through claim/park and must not pin `off` rows into `list`
+    let pool = pool();
+    let mut state = load_state();
+    let before = state.len();
+    state.retain(|id, _| !pool.contains(id));
+    if state.len() != before {
+        save_state(&state);
     }
 }
 

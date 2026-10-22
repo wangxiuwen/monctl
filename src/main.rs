@@ -256,12 +256,41 @@ fn cmd_hidpi(token: Option<&str>, extra: Option<&str>, displays: &[DisplayInfo])
     println!("hidpi on  {} - now rendered at {}x{} (undo: monctl hidpi off {})", d.describe(), cur.width * 2, cur.height * 2, d.id);
 }
 
+/// Monitors of monctl's own virtual display driver, parked or not; empty where
+/// the driver doesn't exist. `monctl driver status` is their dedicated view.
+fn vdd_pool() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        monctl::windows::adapters_named(monctl::winvdd::ADAPTER_NAME, false)
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// Default-list decision, factored out for tests: `in_state` = monctl turned
+/// this display off, `in_pool` = it belongs to our own virtual display driver.
+fn shown_by_default(d: &DisplayInfo, in_state: bool, in_pool: bool) -> bool {
+    // a parked pool monitor is monctl infrastructure, not a screen the user
+    // turned off - recording it as off pinned permanent `off` rows into
+    // `list`. While a tablet claims one it is a real screen and stays listed.
+    if in_pool {
+        return d.active || d.mirror_of.is_some();
+    }
+    d.active || d.mirror_of.is_some() || in_state
+}
+
 /// What `list` shows: displays in use, plus ones monctl turned off. Idle GPU
 /// heads and the outputs of virtual adapters other apps install (Windows
 /// lists every one of them as a display) are noise unless asked for (--all).
 fn listed(displays: &[DisplayInfo], all: bool) -> Vec<&DisplayInfo> {
     let state = common::load_state();
-    displays.iter().filter(|d| all || d.active || d.mirror_of.is_some() || state.contains_key(&d.id)).collect()
+    let pool = vdd_pool();
+    displays
+        .iter()
+        .filter(|d| all || shown_by_default(d, state.contains_key(&d.id), pool.contains(&d.id)))
+        .collect()
 }
 
 fn print_list(displays: &[DisplayInfo]) {
@@ -315,6 +344,7 @@ fn print_list(displays: &[DisplayInfo]) {
 
 fn run_enable(enabled: bool, targets: &[DisplayInfo], explicit: bool) {
     let mut state = common::load_state();
+    let pool = vdd_pool();
     let mut errors = 0;
     let mut changed = 0;
     for t in targets {
@@ -334,7 +364,9 @@ fn run_enable(enabled: bool, targets: &[DisplayInfo], explicit: bool) {
             Ok(()) => {
                 if enabled {
                     state.remove(&t.id);
-                } else {
+                } else if !pool.contains(&t.id) {
+                    // the pool recovers through `driver claim`/`park`; recording
+                    // its monitors made them permanent `off` rows in `list`
                     state.insert(t.id.clone(), t.name.clone());
                 }
                 changed += 1;
@@ -519,7 +551,39 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::id_matches;
+    use super::{id_matches, shown_by_default, DisplayInfo};
+
+    fn display(id: &str, active: bool) -> DisplayInfo {
+        DisplayInfo {
+            id: id.into(),
+            active,
+            main: false,
+            name: "VDD by MTT".into(),
+            detail: String::new(),
+            mirror_of: None,
+        }
+    }
+
+    #[test]
+    fn pool_monitors_stay_off_the_default_list() {
+        // parked pool monitor: hidden even when a stray off recorded it
+        assert!(!shown_by_default(&display("\\\\.\\DISPLAY18", false), true, true));
+        // claimed by a tablet (on the desktop): a real screen, stays listed
+        assert!(shown_by_default(&display("\\\\.\\DISPLAY18", true), true, true));
+        // mirrored pool monitor: showing a picture, stays listed
+        let mut mirrored = display("\\\\.\\DISPLAY19", false);
+        mirrored.mirror_of = Some("\\\\.\\DISPLAY1".into());
+        assert!(shown_by_default(&mirrored, true, true));
+    }
+
+    #[test]
+    fn regular_screens_list_as_before() {
+        assert!(shown_by_default(&display("\\\\.\\DISPLAY1", true), false, false));
+        // turned off by monctl: listed so it can be found again
+        assert!(shown_by_default(&display("\\\\.\\DISPLAY2", false), true, false));
+        // idle output: hidden
+        assert!(!shown_by_default(&display("\\\\.\\DISPLAY3", false), false, false));
+    }
 
     #[test]
     fn id_matching_is_whole_name() {
