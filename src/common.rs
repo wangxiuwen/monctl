@@ -111,6 +111,24 @@ pub fn awake_path() -> PathBuf {
     config_dir().join("monctl/awake.json")
 }
 
+/// Where each display sat when monctl last turned it off (id -> "x,y"), so
+/// turning it back on restores the user's screen arrangement instead of
+/// appending the screen to the right edge of the desktop.
+pub fn layout_path() -> PathBuf {
+    config_dir().join("monctl/layout.json")
+}
+
+pub fn load_layout() -> OffState {
+    fs::read_to_string(layout_path())
+        .ok()
+        .and_then(|s| json_parse_object(&s))
+        .unwrap_or_default()
+}
+
+pub fn save_layout(state: &OffState) {
+    write_atomic(&layout_path(), &json_write_object(state));
+}
+
 fn config_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

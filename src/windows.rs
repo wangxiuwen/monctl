@@ -5,7 +5,7 @@
 // WDDM drivers); a disabled display keeps its registry config, so re-enabling
 // places it to the right of the current desktop.
 
-use crate::common::{DisplayInfo, Mode};
+use crate::common::{load_layout, save_layout, DisplayInfo, Mode};
 use std::ffi::c_void;
 
 type DWORD = u32;
@@ -513,22 +513,55 @@ fn enable_via_ccd(id: &str) -> Result<(), String> {
 pub fn set_enabled(id: &str, enable: bool) -> Result<(), String> {
     check_id(id)?;
     if enable {
-        // attach: restore the stored mode (or any real mode), placed to the right of the desktop
-        let mut dm = match current_settings(id).filter(|dm| dm.dm_pels_width > 0 && dm.dm_pels_height > 0) {
-            Some(dm) => dm,
-            None => match any_real_mode(id) {
-                Some(dm) => dm,
-                // no stored mode (its monitor went away while detached): CCD can still do it
-                None => return enable_via_ccd(id).map_err(|e| format!("cannot re-attach {id}: {e}")),
-            },
-        };
-        // never re-attach below what the panel advertises at this resolution
-        if let Some(hz) = best_frequency_at(id, dm.dm_pels_width, dm.dm_pels_height) {
-            if hz > dm.dm_display_frequency {
-                dm.dm_display_frequency = hz;
-                dm.dm_fields |= DM_DISPLAYFREQUENCY;
-            }
+        attach(id)
+    } else {
+        detach(id)
+    }
+}
+
+/// Turn a display off: remember where it sat (so the next attach restores the
+/// arrangement instead of reshuffling the desktop), then detach. The zero-sized
+/// mode is the documented "pull the cable" trick.
+fn detach(id: &str) -> Result<(), String> {
+    if let Some((x, y, w, _)) = bounds(id) {
+        if w > 0 {
+            let mut layout = load_layout();
+            layout.insert(id.to_string(), format!("{x},{y}"));
+            save_layout(&layout);
         }
+    }
+    let mut dm = DEVMODEW::new();
+    dm.dm_fields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+    dm.dm_pels_width = 0;
+    dm.dm_pels_height = 0;
+    apply(Some(id), &mut dm)
+}
+
+/// Attach a display: restore the stored mode (or any real mode), placed back
+/// where it sat when monctl turned it off. Unknown or taken spots (desktop
+/// rearranged meanwhile, ids renumbered after a reboot) fall back to the old
+/// behaviour: the right edge of the desktop, top-aligned.
+fn attach(id: &str) -> Result<(), String> {
+    let mut dm = match current_settings(id).filter(|dm| dm.dm_pels_width > 0 && dm.dm_pels_height > 0) {
+        Some(dm) => dm,
+        None => match any_real_mode(id) {
+            Some(dm) => dm,
+            // no stored mode (its monitor went away while detached): CCD can
+            // still do it, then we move it back to its old spot below
+            None => {
+                enable_via_ccd(id).map_err(|e| format!("cannot re-attach {id}: {e}"))?;
+                return place_back_after_ccd(id);
+            }
+        },
+    };
+    // never re-attach below what the panel advertises at this resolution
+    if let Some(hz) = best_frequency_at(id, dm.dm_pels_width, dm.dm_pels_height) {
+        if hz > dm.dm_display_frequency {
+            dm.dm_display_frequency = hz;
+            dm.dm_fields |= DM_DISPLAYFREQUENCY;
+        }
+    }
+    let spot = remembered_spot(id, dm.dm_pels_width as i32, dm.dm_pels_height as i32).unwrap_or_else(|| {
         let right_edge = list()
             .iter()
             .filter(|d| d.active)
@@ -537,17 +570,51 @@ pub fn set_enabled(id: &str, enable: bool) -> Result<(), String> {
             .map(|dm| unsafe { dm.u.position.x } + dm.dm_pels_width as i32)
             .max()
             .unwrap_or(0);
-        dm.dm_fields |= DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
-        dm.u.position = POINTL { x: right_edge, y: 0 }; // writing a union field is safe; only reads are unsafe
-        apply(Some(id), &mut dm)
-    } else {
-        // detach: zero-sized mode is the documented "pull the cable" trick
-        let mut dm = DEVMODEW::new();
-        dm.dm_fields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
-        dm.dm_pels_width = 0;
-        dm.dm_pels_height = 0;
-        apply(Some(id), &mut dm)
-    }
+        (right_edge, 0)
+    });
+    dm.dm_fields |= DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+    dm.u.position = POINTL { x: spot.0, y: spot.1 }; // writing a union field is safe; only reads are unsafe
+    apply(Some(id), &mut dm)
+}
+
+/// CCD attach leaves Windows to pick the spot (usually right of the desktop);
+/// move the screen back where it sat before it went off. Best effort - a
+/// display that came back at the wrong place is still better than none.
+fn place_back_after_ccd(id: &str) -> Result<(), String> {
+    let Some(mut dm) = current_settings(id).filter(|dm| dm.dm_pels_width > 0 && dm.dm_pels_height > 0) else {
+        return Ok(());
+    };
+    let Some(spot) = remembered_spot(id, dm.dm_pels_width as i32, dm.dm_pels_height as i32) else {
+        return Ok(());
+    };
+    dm.dm_fields = DM_POSITION;
+    dm.u.position = POINTL { x: spot.0, y: spot.1 };
+    apply(Some(id), &mut dm)
+}
+
+/// "x,y" the display sat at when monctl turned it off (layout.json) - but only
+/// if that rectangle is free: while the screen was off the desktop may have
+/// been rearranged, and two displays must never share a spot.
+fn remembered_spot(id: &str, w: i32, h: i32) -> Option<(i32, i32)> {
+    let (x, y) = parse_pos(load_layout().get(id)?)?;
+    let taken = list()
+        .iter()
+        .filter(|d| d.active)
+        .filter_map(|d| bounds(&d.id))
+        .any(|b| rects_overlap((x, y, w, h), b));
+    (!taken).then_some((x, y))
+}
+
+fn parse_pos(s: &str) -> Option<(i32, i32)> {
+    let (x, y) = s.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// Top-left corner + size rectangles with positive overlap.
+fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    let (ax, ay, aw, ah) = a;
+    let (bx, by, bw, bh) = b;
+    ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
 }
 
 fn check_id(id: &str) -> Result<(), String> {
@@ -641,5 +708,26 @@ mod tests {
         edid[77..90].copy_from_slice(b"DELL P2314H\n ");
         assert_eq!(super::edid_product_name(&edid).as_deref(), Some("DELL P2314H"));
         assert_eq!(super::edid_product_name(&[0u8; 128]), None);
+    }
+
+    #[test]
+    fn saved_positions_round_trip() {
+        // a screen parked left of / above the main display has negative coords
+        assert_eq!(super::parse_pos("-1920,0"), Some((-1920, 0)));
+        assert_eq!(super::parse_pos("0,0"), Some((0, 0)));
+        assert_eq!(super::parse_pos(" 3840, 2160 "), Some((3840, 2160)));
+        assert_eq!(super::parse_pos("1920"), None);
+        assert_eq!(super::parse_pos("a,b"), None);
+        assert_eq!(super::parse_pos(""), None);
+    }
+
+    #[test]
+    fn spot_kept_only_when_free() {
+        let keep = (0, 0, 1920, 1080);
+        assert!(super::rects_overlap(keep, keep)); // itself: taken
+        assert!(super::rects_overlap(keep, (1000, 500, 1920, 1080)));
+        assert!(!super::rects_overlap(keep, (1920, 0, 1920, 1080))); // exactly adjacent
+        assert!(!super::rects_overlap(keep, (0, 1080, 1920, 1080)));
+        assert!(!super::rects_overlap(keep, (-1920, 0, 1920, 1080)));
     }
 }
