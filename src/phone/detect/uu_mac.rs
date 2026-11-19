@@ -13,12 +13,13 @@ impl super::Detector for UuMac {
     }
 
     fn poll(&mut self) -> Vec<Signal> {
-                // Being controlled: the UURemoteServer overlay on screen or the
-        // server process running. v1 skips the AX controller-table read
-        // (needs Accessibility), so the signal is Unknown and Fusion
-        // treats it as a phone after the grace period.
-        if crate::phone::detect::probe_mac::owner_on_screen("UURemote")
-            || crate::phone::detect::probe_mac::process_running("UURemoteServer")
+                // Being controlled: the UURemoteServer process is resident even when
+        // idle, so process presence proves nothing. The controlled-session
+        // overlay window on screen is the signal (same one Snug uses).
+        // Marked experimental until calibrated against a real phone session:
+        // run `monctl phone detect` while controlled to check it fires.
+        if crate::phone::detect::probe_mac::owner_on_screen("UURemoteServer")
+            || crate::phone::detect::probe_mac::owner_on_screen("UU远程")
         {
             vec![Signal { app: "uu", device: super::Device::Unknown }]
         } else {

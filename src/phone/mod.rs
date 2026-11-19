@@ -52,12 +52,45 @@ pub fn run(args: &[String]) {
         "place" | "restore" | "windows" => window::run_cli(args),
         "watch" => watch::run_cli(&args[1..]),
         "watchd" => watch::run_detached(),
+        "detect" => detect_diag(),
+        "trust" => trust_cli(),
         "gesture" => gesture::run_cli(),
         "library" => library::run_cli(),
         "-h" | "--help" | "help" => phone_usage(),
         other => {
             let _ = other;
             phone_usage();
+        }
+    }
+}
+
+/// `monctl phone detect` - what each detector sees right now, for
+/// calibration: run it while a phone is controlling to see which signals fire.
+/// `monctl phone trust` - pop the standard Accessibility permission dialog
+/// on the Mac's screen (works over SSH); print the resulting state.
+fn trust_cli() {
+    #[cfg(target_os = "macos")]
+    {
+        let ok = window::mac::trust_prompt();
+        if ok {
+            println!("accessibility: granted");
+        } else {
+            println!("accessibility: a dialog appeared on the Mac screen - click \"Open System Settings\", then switch the highlighted entry ON and re-run `monctl phone detect`");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    crate::common::fail("trust is macOS-only");
+}
+
+fn detect_diag() {
+    for mut d in detect::registry() {
+        let signals = d.poll();
+        if signals.is_empty() {
+            println!("{:<10} no signal", d.name());
+        } else {
+            for s in signals {
+                println!("{:<10} {:?} ({})", d.name(), s.device, d.inset());
+            }
         }
     }
 }

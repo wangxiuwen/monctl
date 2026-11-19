@@ -48,8 +48,25 @@ pub fn run_detached() {
             Err(e) => crate::common::fail(&format!("cannot start the watcher: {e}")),
         }
     }
-    #[cfg(not(windows))]
-    crate::common::fail("watchd is Windows-only for now (macOS: launchd or add to login items)");
+    #[cfg(target_os = "macos")]
+    {
+        let exe = std::env::current_exe().unwrap_or_else(|_| "/Applications/monctl.app/Contents/MacOS/monctl".into());
+        let log = format!("{}/Library/Logs/monctl-watch.log", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
+        let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log).ok();
+        let (out, err) = match log_file {
+            Some(f) => (f.try_clone().map(std::process::Stdio::from).unwrap_or(std::process::Stdio::null()), std::process::Stdio::from(f)),
+            None => (std::process::Stdio::null(), std::process::Stdio::null()),
+        };
+        match std::process::Command::new(exe)
+            .args(["phone", "watch"])
+            .stdout(out)
+            .stderr(err)
+            .spawn()
+        {
+            Ok(_) => println!("watcher detached, log: {}", log),
+            Err(e) => crate::common::fail(&format!("cannot start the watcher: {e}")),
+        }
+    }
 }
 
 pub fn run_cli(args: &[String]) {

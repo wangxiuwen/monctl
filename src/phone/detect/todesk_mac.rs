@@ -1,4 +1,9 @@
-// ToDesk on macOS. Signals need calibration on a real session.
+// ToDesk on macOS.
+//
+// Disabled until calibrated: the client is resident on machines that have
+// it, so process and window probes fire while idle - false phone sessions.
+// Calibrate with `monctl phone detect` during a real controlled session
+// before re-enabling.
 use super::Signal;
 
 pub struct TodeskMac;
@@ -13,13 +18,6 @@ impl super::Detector for TodeskMac {
     }
 
     fn poll(&mut self) -> Vec<Signal> {
-                // Experimental: needs calibration against a real controlled session.
-        if crate::phone::detect::probe_mac::owner_on_screen("ToDesk")
-            || crate::phone::detect::probe_mac::process_running("ToDesk")
-        {
-            vec![Signal { app: "todesk", device: super::Device::Unknown }]
-        } else {
-            Vec::new()
-        }
+        Vec::new()
     }
 }

@@ -1,4 +1,7 @@
-// Sunlogin (向日葵) on macOS. Signals need calibration on a real session.
+// Sunlogin (向日葵) on macOS.
+//
+// Disabled until calibrated (same reason as ToDesk: the resident client
+// makes idle probes fire).
 use super::Signal;
 
 pub struct SunloginMac;
@@ -13,13 +16,6 @@ impl super::Detector for SunloginMac {
     }
 
     fn poll(&mut self) -> Vec<Signal> {
-                // Experimental: needs calibration against a real controlled session.
-        if crate::phone::detect::probe_mac::owner_on_screen("Sunlogin")
-            || crate::phone::detect::probe_mac::process_running("SunloginClient")
-        {
-            vec![Signal { app: "sunlogin", device: super::Device::Unknown }]
-        } else {
-            Vec::new()
-        }
+        Vec::new()
     }
 }

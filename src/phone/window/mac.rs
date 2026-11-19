@@ -269,6 +269,37 @@ pub fn trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
+/// Ask for the Accessibility permission with the standard system dialog
+/// ("monctl wants to control this computer"). Works over SSH: the dialog
+/// appears on the Mac's own screen; the entry lands in the Accessibility
+/// list automatically, highlighted. Returns whether we are trusted now.
+pub fn trust_prompt() -> bool {
+    extern "C" {
+        fn AXIsProcessTrustedWithOptions(options: Id) -> bool;
+        fn CFDictionaryCreate(alloc: *const c_void, keys: *const c_void, values: *const c_void, n: isize, key_cb: *const c_void, value_cb: *const c_void) -> Id;
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
+        static kCFBooleanTrue: Id;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, enc: u32) -> Id;
+    }
+    const UTF8: u32 = 0x0800_0100;
+    unsafe {
+        let key = CFStringCreateWithCString(std::ptr::null(), c"AXTrustedCheckOptionPrompt".as_ptr(), UTF8);
+        let opts = CFDictionaryCreate(
+            std::ptr::null(),
+            [&key] as *const _ as *const c_void,
+            [&kCFBooleanTrue] as *const _ as *const c_void,
+            1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        );
+        AXIsProcessTrustedWithOptions(opts)
+    }
+}
+
 pub fn list_windows() -> Vec<Movable> {
     if !trusted() {
         eprintln!(
