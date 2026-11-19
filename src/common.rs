@@ -30,6 +30,7 @@ usage:
   monctl mirror ID [SOURCE]    show SOURCE (default: main) on display ID; `mirror off` undoes
   monctl hidpi [ID] | off [ID] macOS: crisp HiDPI rendering on any monitor
   monctl virtual [add [WxH[@Hz]] [--name N] [--no-hidpi] | rm ID|all]   macOS: virtual displays
+  monctl phone models|fit|on|off|status       a phone-shaped portrait display for remote control
   monctl cast [--port N] [--display ID|main]   tablets (iPad/Android/Windows) as extra screens
   monctl driver [status|install|uninstall]     Windows: the screen driver cast uses
   monctl sidecar [NAME|off]    macOS: iPad as a display via Apple's Sidecar (USB or wireless)

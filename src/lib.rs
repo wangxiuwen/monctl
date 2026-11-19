@@ -9,6 +9,7 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod qr;
+pub mod phone;
 #[cfg(target_os = "macos")]
 pub mod sidecar;
 #[cfg(target_os = "macos")]

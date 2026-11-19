@@ -56,9 +56,9 @@ fn has_mode(id: u32) -> bool {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct CGSize {
-    w: f64,
-    h: f64,
+pub(crate) struct CGSize {
+    pub(crate) w: f64,
+    pub(crate) h: f64,
 }
 
 // Vendor/product make macOS treat each serial as one stable "monitor", so
@@ -88,32 +88,32 @@ pub(crate) unsafe fn send(obj: Id, s: &str) -> Id {
     f(obj, sel(s))
 }
 
-unsafe fn send_id(obj: Id, s: &str, a: Id) -> Id {
+pub(crate) unsafe fn send_id(obj: Id, s: &str, a: Id) -> Id {
     let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = std::mem::transmute(msg_fn());
     f(obj, sel(s), a)
 }
 
-unsafe fn send_u32(obj: Id, s: &str, a: u32) {
+pub(crate) unsafe fn send_u32(obj: Id, s: &str, a: u32) {
     let f: unsafe extern "C" fn(Id, Sel, u32) = std::mem::transmute(msg_fn());
     f(obj, sel(s), a)
 }
 
-unsafe fn send_size(obj: Id, s: &str, a: CGSize) {
+pub(crate) unsafe fn send_size(obj: Id, s: &str, a: CGSize) {
     let f: unsafe extern "C" fn(Id, Sel, CGSize) = std::mem::transmute(msg_fn());
     f(obj, sel(s), a)
 }
 
-unsafe fn send_bool_id(obj: Id, s: &str, a: Id) -> bool {
+pub(crate) unsafe fn send_bool_id(obj: Id, s: &str, a: Id) -> bool {
     let f: unsafe extern "C" fn(Id, Sel, Id) -> bool = std::mem::transmute(msg_fn());
     f(obj, sel(s), a)
 }
 
-unsafe fn send_ret_u32(obj: Id, s: &str) -> u32 {
+pub(crate) unsafe fn send_ret_u32(obj: Id, s: &str) -> u32 {
     let f: unsafe extern "C" fn(Id, Sel) -> u32 = std::mem::transmute(msg_fn());
     f(obj, sel(s))
 }
 
-unsafe fn new_mode(w: u32, h: u32, hz: f64) -> Id {
+pub(crate) unsafe fn new_mode(w: u32, h: u32, hz: f64) -> Id {
     let f: unsafe extern "C" fn(Id, Sel, u32, u32, f64) -> Id = std::mem::transmute(msg_fn());
     f(send(class("CGVirtualDisplayMode"), "alloc"), sel("initWithWidth:height:refreshRate:"), w, h, hz)
 }

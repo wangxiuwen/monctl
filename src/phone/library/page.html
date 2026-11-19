@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>monctl 手机屏</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; }
+  body { font-family: -apple-system, "PingFang SC", sans-serif; background: #000; color: #fff; padding-bottom: 90px; }
+  .search { position: sticky; top: 0; background: #000; padding: 14px 16px 10px; }
+  .search input { width: 100%; background: #1c1c1e; border: 0; border-radius: 10px; color: #fff; font-size: 17px; padding: 10px 14px; outline: none; }
+  h2 { font-size: 21px; margin: 18px 16px 10px; color: #ccc; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 14px 8px; padding: 0 16px; }
+  .app { text-align: center; cursor: pointer; }
+  .icon { width: 60px; height: 60px; margin: 0 auto 6px; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 30px; font-weight: 600; color: #fff; background: linear-gradient(145deg, #0a84ff, #0066d6); }
+  .app span { display: block; font-size: 12px; line-height: 1.2; height: 30px; overflow: hidden; color: #eee; }
+  .running .icon { background: linear-gradient(145deg, #30d158, #1a9940); }
+  .row { display: flex; align-items: center; padding: 8px 16px; cursor: pointer; }
+  .row .icon { width: 44px; height: 44px; font-size: 20px; border-radius: 10px; margin: 0 12px 0 0; flex: none; }
+  .row span { font-size: 16px; }
+  .quit { margin-left: auto; color: #ff453a; font-size: 13px; border: 1px solid #ff453a; border-radius: 6px; padding: 3px 8px; }
+  .empty { color: #555; text-align: center; margin-top: 60px; font-size: 15px; }
+</style>
+</head>
+<body>
+<div class="search"><input id="q" type="search" placeholder="搜索 App 与窗口" autocomplete="off"></div>
+<div id="running"></div>
+<div id="all"></div>
+<div class="empty" id="none" style="display:none">没有匹配的 App</div>
+<script>
+let APPS = __APPS_JSON__.apps;
+const q = document.getElementById('q');
+
+function iconColor(name) {
+  let h = 0; for (const c of name) h = (h * 31 + c.codePointAt(0)) % 360;
+  return `linear-gradient(145deg, hsl(${h},70%,55%), hsl(${h},80%,40%))`;
+}
+
+function render() {
+  const ql = q.value.trim().toLowerCase();
+  const match = a => !ql || a.name.toLowerCase().includes(ql);
+  const running = APPS.filter(a => a.running && match(a));
+  const installed = APPS.filter(a => !a.running && match(a));
+  const iconHTML = a => `<div class="icon" style="background:${iconColor(a.name)}">${a.name.slice(0, 1).toUpperCase()}</div>`;
+  document.getElementById('running').innerHTML = running.length
+    ? `<h2>运行中</h2>` + running.map(a =>
+        `<div class="app row running" data-name="${a.name}">${iconHTML(a)}<span>${a.name}</span><span class="quit" data-quit="${a.name}">退出</span></div>`).join('')
+    : '';
+  document.getElementById('all').innerHTML = installed.length
+    ? `<h2>全部</h2><div class="grid">` + installed.map(a =>
+        `<div class="app" data-name="${a.name}">${iconHTML(a)}<span>${a.name}</span></div>`).join('') + `</div>`
+    : '';
+  document.getElementById('none').style.display = (running.length + installed.length) ? 'none' : 'block';
+}
+
+document.body.addEventListener('click', e => {
+  const quit = e.target.closest('[data-quit]');
+  if (quit) {
+    if (confirm(`退出「${quit.dataset.quit}」？`)) fetch('/quit/' + encodeURIComponent(quit.dataset.quit), { method: 'POST' }).then(refresh);
+    return;
+  }
+  const app = e.target.closest('[data-name]');
+  if (app) fetch('/open/' + encodeURIComponent(app.dataset.name), { method: 'POST' }).then(refresh);
+});
+
+function refresh() { fetch('/apps.json').then(r => r.json()).then(d => { APPS = d.apps; render(); }); }
+q.addEventListener('input', render);
+setInterval(refresh, 1500);
+render();
+</script>
+</body>
+</html>

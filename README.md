@@ -15,6 +15,13 @@ tray app). macOS / Windows / Linux.
 - **Any tablet as an extra screen** (macOS, Windows or Linux/X11 → iPad /
   Android / Windows tablets) — over Wi-Fi or USB, nothing to install on the
   tablet; it gets its screen back after a drop.
+- **A phone-shaped portrait display for remote control** (macOS, Windows) —
+  when a phone controls this machine through UU Remote (ToDesk/Sunlogin
+  experimental), `phone watch` adds a dedicated portrait screen with the
+  phone's proportions, windows fill it, and injected mouse events are
+  re-interpreted there: one finger scrolls with inertia, a long press is a
+  right click, long-press-drag selects text. An app library is the home
+  page. When the session ends, windows go back where they were.
 - **Keep awake** / sleep now.
 
 ```console
@@ -67,6 +74,7 @@ monctl hidpi [ID] | off [ID] macOS: crisp HiDPI rendering on any monitor
 monctl virtual [add [WxH[@Hz]] [--name N] [--no-hidpi] | rm ID|all]   macOS
 monctl cast [--port N] [--display ID|main] [--bitrate MBPS]          macOS, Windows, Linux (X11)
 monctl driver [status|install|uninstall|restart]                     Windows: cast's screen driver
+monctl phone [models|fit|on|off|status|place|restore|gesture|library|watch]   a phone-shaped display for remote control
 monctl sidecar [NAME|off]                                            macOS: iPad via Apple's Sidecar
 
 monctl awake [DURATION]      prevent sleep (2h, 90m, 2h30m, 3600; default: until off)

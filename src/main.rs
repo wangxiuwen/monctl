@@ -406,6 +406,7 @@ fn main() {
         "-h" | "--help" | "help" => usage(),
         "awake" => awake::run(&args[1..]),
         "sleep" => awake::sleep_now(),
+        "phone" => return monctl::phone::run(&args[1..]),
         #[cfg(target_os = "macos")]
         "virtual" | "virt" => monctl::virt::run(&args[1..]),
         "cast" | "tablet" => monctl::cast::run(&args[1..]),
