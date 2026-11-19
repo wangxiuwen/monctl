@@ -51,6 +51,7 @@ pub fn run(args: &[String]) {
         "on" | "off" | "status" => display::run_cli(args),
         "place" | "restore" | "windows" => window::run_cli(args),
         "watch" => watch::run_cli(&args[1..]),
+        "watchd" => watch::run_detached(),
         "gesture" => gesture::run_cli(),
         "library" => library::run_cli(),
         "-h" | "--help" | "help" => phone_usage(),
@@ -84,6 +85,7 @@ usage:
                                watch the remote apps (UU Remote, ToDesk, Sunlogin):
                                a phone connecting adds the display + library + gestures,
                                leaving restores windows and removes it
+  monctl phone watchd          same, detached from the console (what autostart runs)
 "#
     );
     std::process::exit(0);

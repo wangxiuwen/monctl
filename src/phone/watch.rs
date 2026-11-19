@@ -16,6 +16,42 @@ extern "C" fn on_sigint(_sig: i32) {
     STOP.store(true, Ordering::SeqCst);
 }
 
+/// `monctl phone watchd` - detach a watcher from the console (autostart
+/// entry uses this): spawn `phone watch` with no window, log to a file.
+pub fn run_detached() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        let exe = std::env::current_exe().unwrap_or_else(|_| "monctl.exe".into());
+        let log = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+        let log = format!("{}\\monctl\\watch.log", log);
+        if let Some(dir) = std::path::Path::new(&log).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // rotate: keep the log from growing forever
+        let _ = std::fs::rename(&log, format!("{}.old", log));
+        let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log).ok();
+        let (out, err) = match log_file {
+            Some(f) => (std::process::Stdio::from(f.try_clone().unwrap()), std::process::Stdio::from(f)),
+            None => (std::process::Stdio::null(), std::process::Stdio::null()),
+        };
+        match std::process::Command::new(exe)
+            .args(["phone", "watch"])
+            .stdout(out)
+            .stderr(err)
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+            .spawn()
+        {
+            Ok(_) => println!("watcher detached, log: {}", log),
+            Err(e) => crate::common::fail(&format!("cannot start the watcher: {e}")),
+        }
+    }
+    #[cfg(not(windows))]
+    crate::common::fail("watchd is Windows-only for now (macOS: launchd or add to login items)");
+}
+
 pub fn run_cli(args: &[String]) {
     let mut choice = super::Choice::from_flags(
         args.iter().position(|a| a == "--model").and_then(|i| args.get(i + 1).map(String::as_str)),

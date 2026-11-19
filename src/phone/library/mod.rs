@@ -105,8 +105,8 @@ pub fn run_server(catalog: impl Catalog + Send + Sync + 'static) -> std::io::Res
                     ("GET", "/apps.json") => ("200", "application/json", apps_json(&catalog)),
                     ("POST", p) if p.starts_with("/open/") => {
                         let name = url_decode(&p["/open/".len()..]);
-                        match catalog.open(&name) {
-                            Ok(()) => ("200", "text/plain", "ok".into()),
+                        match crate::phone::window::open_and_place(&catalog, &name) {
+                            Ok(msg) => ("200", "text/plain", msg),
                             Err(e) => ("500", "text/plain", e),
                         }
                     }

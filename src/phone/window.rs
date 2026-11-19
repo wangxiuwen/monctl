@@ -123,6 +123,8 @@ fn pick_target(query: &str, _area: &DisplayArea) -> Option<Movable> {
 /// Record, fill, read back, widen if the app refuses to shrink, refill.
 /// Returns a human line.
 pub fn place_window(mut win: Movable, fit: &Fit, mut area: DisplayArea) -> String {
+    // Returns a human line on success, an explanation on failure; never exits
+    // (the library calls this from inside the watch process).
     if win.minimized {
         platform::set_minimized(&win.id, false);
         win = platform::refresh(&win.id).unwrap_or(win);
@@ -140,7 +142,7 @@ pub fn place_window(mut win: Movable, fit: &Fit, mut area: DisplayArea) -> Strin
         zoom: 0,
         placed_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
     }) {
-        crate::common::fail("cannot persist the restore record - leaving the window alone");
+        return "cannot persist the restore record - the window was left alone".to_string();
     }
     let mut current = fit.base_width;
     for _ in 0..3 {
@@ -240,6 +242,35 @@ fn restore_one(id: WindowId, records: &mut Records) -> Result<(), String> {
 /// The phone display's geometry, from the platform mover.
 pub fn phone_display_area() -> Option<DisplayArea> {
     platform::phone_display_area()
+}
+
+/// Open an app from the library and land its window on the phone display -
+/// the whole point of the screen, no dragging involved. If the app was
+/// already running and no new window appears, its existing window is moved
+/// instead: tapping an entry always ends with something filling the phone.
+pub fn open_and_place(catalog: &impl crate::phone::library::Catalog, name: &str) -> Result<String, String> {
+    let before: std::collections::HashSet<WindowId> = platform::list_windows().into_iter().map(|w| w.id).collect();
+    catalog.open(name)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if let Some(win) = platform::list_windows().into_iter().find(|w| !before.contains(&w.id)) {
+            return finish_place(win, name);
+        }
+    }
+    // No new window: the app was already running - grab its existing window.
+    let ql = name.to_lowercase();
+    let Some(win) = platform::list_windows().into_iter().find(|w| w.app.to_lowercase().contains(&ql) || w.title.to_lowercase().contains(&ql)) else {
+        return Err(format!("{name} opened but no window appeared"));
+    };
+    finish_place(win, name)
+}
+
+fn finish_place(win: Movable, name: &str) -> Result<String, String> {
+    let area = phone_display_area().ok_or("phone display is not on")?;
+    let fit = platform::held_fit().ok_or("phone display is not on")?;
+    // Remember the level for next time: first placement uses the default.
+    Ok(place_window(win, &fit, area))
 }
 
 /// Restore everything that is still placed - the watch loop and teardown use it.
