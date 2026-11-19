@@ -87,6 +87,12 @@ struct PaintStruct {
 }
 
 static APP_LIST: Mutex<Vec<App>> = Mutex::new(Vec::new());
+/// Raw HWND wrapper: the handle is only dereferenced on the window thread.
+#[repr(transparent)]
+struct Hwnd(*mut c_void);
+unsafe impl Send for Hwnd {}
+unsafe impl Sync for Hwnd {}
+static WINDOW: Mutex<Option<Hwnd>> = Mutex::new(None);
 
 #[link(name = "user32")]
 extern "system" {
@@ -111,6 +117,7 @@ extern "system" {
     fn GetSysColorBrush(i: i32) -> *mut c_void;
     fn InvalidateRect(h: HWND, r: *const Rect, erase: bool) -> i32;
     fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    fn PostMessageW(h: *mut c_void, msg: u32, w: WPARAM, l: LPARAM) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -207,6 +214,14 @@ impl Catalog for WinCatalog {
     }
 }
 
+/// Close the library window (the watch loop does this on session end).
+pub fn hide() {
+    let Some(hwnd) = WINDOW.lock().unwrap().take() else { return };
+    unsafe {
+        PostMessageW(hwnd.0, WM_CLOSE, 0, 0);
+    }
+}
+
 /// Show the list window filling the phone display's usable area.
 pub fn show() -> Result<(), String> {
     let Some(area) = crate::phone::window::phone_display_area() else { return Err("phone display is not on".into()) };
@@ -232,6 +247,7 @@ pub fn show() -> Result<(), String> {
         if h.is_null() {
             return Err(format!("CreateWindowExW: {}", std::io::Error::last_os_error()));
         }
+        *WINDOW.lock().unwrap() = Some(Hwnd(h));
         ShowWindow(h, 5);
         start_server();
         let mut msg = Msg::default();

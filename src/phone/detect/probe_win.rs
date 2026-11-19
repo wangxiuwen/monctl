@@ -285,8 +285,11 @@ pub fn uu_server_log_dir() -> Option<std::path::PathBuf> {
     Some(root.join("log").join("server").join("log"))
 }
 
-/// The calibrated UU "this machine is being controlled" signal.
+/// The calibrated UU "this machine is being controlled" signal. The streamer
+/// log is event-driven: ~5-15s apart while the picture is interactive, and
+/// it can pause 30s+ when the phone just watches a still screen - so the
+/// freshness window is 60s, not tighter.
 pub fn uu_controlled() -> bool {
     let Some(dir) = uu_server_log_dir() else { return false };
-    fresh_file(&dir, "streamer_log_controlled_", 15)
+    fresh_file(&dir, "streamer_log_controlled_", 60)
 }

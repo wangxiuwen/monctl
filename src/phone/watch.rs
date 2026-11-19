@@ -62,12 +62,16 @@ pub fn run_cli(args: &[String]) {
                     Ok(msg) => {
                         println!("[{}] phone connected - display on: {msg}", stamp());
                         start_gestures();
+                        if let Err(e) = super::library::show() {
+                            println!("[{}] library not shown: {e}", stamp());
+                        }
                     }
                     Err(e) => println!("[{}] phone connected but the display failed: {e}", stamp()),
                 }
             }
             super::detect::Action::Remove => {
                 stop_gestures();
+                super::library::hide();
                 let back = window::restore_all_placed();
                 match display::turn_off() {
                     Ok(msg) => println!("[{}] session ended - {msg}, {back} window(s) home", stamp()),

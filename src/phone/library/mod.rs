@@ -14,6 +14,11 @@ pub mod mac;
 #[cfg(windows)]
 pub mod win;
 
+#[cfg(target_os = "macos")]
+pub use mac::{hide, refit, show};
+#[cfg(windows)]
+pub use win::{hide, show};
+
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 

@@ -30,8 +30,11 @@ const HARDWARE_ID: &str = "Root\\MttVDD";
 /// Adapter description VDD's monitors hang off (EnumDisplayDevices DeviceString).
 pub const ADAPTER_NAME: &str = "Virtual Display Driver";
 const PIPE: &str = "\\\\.\\pipe\\MTTVirtualDisplayPipe";
-/// Monitors the device starts with: one per concurrently connected tablet.
-pub const POOL: usize = 4;
+/// Monitors the device starts with. Four allowed several tablets at once,
+/// but remote apps list every monitor of the adapter - disabled pool
+/// spares included - so a phone-control session would show four phone
+/// screens. One covers the common case (one tablet, or the phone display).
+pub const POOL: usize = 1;
 /// The driver builds no monitor at all when offered more than 50 modes
 /// (51 fails, verified on 26200) - so this list is curated, not exhaustive.
 const MAX_MODES: usize = 50;
@@ -192,7 +195,8 @@ pub fn restart() -> Result<(), String> {
     const DICS_PROPCHANGE: u32 = 3;
     const DICS_FLAG_GLOBAL: u32 = 1;
     if !is_admin() {
-        return Err("restarting a driver needs administrator rights".into());
+        // Same one-UAC-prompt pattern as install: relaunch self elevated.
+        return elevate(&["driver", "restart"]).and(Ok(()));
     }
     let mut result = Err("the virtual display driver is not installed".to_string());
     for_each_vdd_device(|set, data| unsafe {
@@ -639,6 +643,12 @@ pub fn run_cli(args: &[String]) -> ! {
             for d in pool() {
                 println!("  {d}  {}", if on.contains(&d) { "on the desktop" } else { "parked" });
             }
+        }
+        Some("rewrite") => {
+            // Rewrite the settings (pool count, learned sizes) and restart
+            // the device so the driver rebuilds its monitors from them.
+            write_settings().and_then(|()| restart()).map(|()| println!("settings rewritten, driver restarted"))
+                .unwrap_or_else(|e| fail(&e));
         }
         Some("park") => {
             park();
