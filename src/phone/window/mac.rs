@@ -288,10 +288,12 @@ pub fn trust_prompt() -> bool {
     const UTF8: u32 = 0x0800_0100;
     unsafe {
         let key = CFStringCreateWithCString(std::ptr::null(), c"AXTrustedCheckOptionPrompt".as_ptr(), UTF8);
+        let keys: [Id; 1] = [key];
+        let values: [Id; 1] = [kCFBooleanTrue];
         let opts = CFDictionaryCreate(
             std::ptr::null(),
-            [&key] as *const _ as *const c_void,
-            [&kCFBooleanTrue] as *const _ as *const c_void,
+            keys.as_ptr() as *const c_void,
+            values.as_ptr() as *const c_void,
             1,
             &kCFTypeDictionaryKeyCallBacks,
             &kCFTypeDictionaryValueCallBacks,
