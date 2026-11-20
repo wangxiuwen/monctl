@@ -242,8 +242,10 @@ pub fn show() -> Result<(), String> {
         };
         RegisterClassW(&wc);
         let title: Vec<u16> = "monctl 手机屏\0".encode_utf16().collect();
-        // WS_POPUP | WS_VISIBLE, on the phone display's usable rect
-        let h = CreateWindowExW(0x80000, class_name.as_ptr(), title.as_ptr(), 0x9000_0000, area.usable.0 as i32, area.usable.1 as i32, area.usable.2 as i32, (area.usable.3 - 56.0) as i32, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null_mut());
+        // WS_POPUP | WS_VISIBLE, on the phone display's usable rect;
+        // WS_EX_TOOLWINDOW keeps the display's home page out of the taskbar
+        // and Alt+Tab — it's the display's surface, not an app the user runs.
+        let h = CreateWindowExW(0x80000 | 0x80, class_name.as_ptr(), title.as_ptr(), 0x9000_0000, area.usable.0 as i32, area.usable.1 as i32, area.usable.2 as i32, (area.usable.3 - 56.0) as i32, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null_mut());
         if h.is_null() {
             return Err(format!("CreateWindowExW: {}", std::io::Error::last_os_error()));
         }

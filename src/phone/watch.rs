@@ -69,7 +69,53 @@ pub fn run_detached() {
     }
 }
 
+/// Launched raw (double-click / Run / a shortcut) instead of `phone watchd`,
+/// a console-subsystem watcher gets its own console — a `monctl.exe` button
+/// parked on the taskbar for as long as it watches (with Windows Terminal as
+/// the default terminal the window is hosted by another process, so hiding
+/// the client-side window doesn't remove it). When the console was opened
+/// just for us (we are its only process), hand over to a window-free copy
+/// that logs to the watch log, like `watchd` does. From a real terminal
+/// (shared console, process count > 1) the output stays put.
+#[cfg(windows)]
+fn detach_from_orphan_console(args: &[String]) {
+    use std::os::windows::process::CommandExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
+    }
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let mut list = [0u32; 8];
+    let n = unsafe { GetConsoleProcessList(list.as_mut_ptr(), list.len() as u32) };
+    if n != 1 {
+        return; // a terminal's shared console, or none at all — nothing to shed
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(base) = std::env::var("LOCALAPPDATA") else { return }; // no log home: keep the console rather than go silent
+    let log = format!("{base}\\monctl\\watch.log");
+    if let Some(dir) = std::path::Path::new(&log).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::rename(&log, format!("{log}.old"));
+    let Ok(log_file) = std::fs::OpenOptions::new().create(true).append(true).open(&log) else { return };
+    let err = log_file.try_clone().expect("watch log handle");
+    match std::process::Command::new(&exe)
+        .args(["phone", "watch"])
+        .args(args)
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(err))
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn()
+    {
+        Ok(_) => std::process::exit(0), // the window-free copy carries on
+        Err(_) => {} // spawn failed: stay attached rather than not run
+    }
+}
+
 pub fn run_cli(args: &[String]) {
+    #[cfg(windows)]
+    detach_from_orphan_console(args);
     let mut choice = super::Choice::from_flags(
         args.iter().position(|a| a == "--model").and_then(|i| args.get(i + 1).map(String::as_str)),
         args.iter().position(|a| a == "--size").and_then(|i| args.get(i + 1)).and_then(|v| {
